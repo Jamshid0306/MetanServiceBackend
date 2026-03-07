@@ -48,6 +48,19 @@ def parse_numeric_price(price: Optional[Any]) -> Optional[float]:
     return float(digits)
 
 
+def parse_bool_flag(value: Optional[Any]) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_credit_percent(value: Optional[Any]) -> Optional[int]:
+    parsed = parse_numeric_price(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
 def normalize_config_options(raw_options: Optional[Any]) -> dict[str, list[dict[str, Any]]]:
     options_data: Any = raw_options
     if isinstance(raw_options, str):
@@ -106,6 +119,8 @@ def serialize_product(product: models.Product, include_full_details: bool = True
         "price_uz": product.price_uz,
         "price_ru": product.price_ru,
         "price_en": product.price_en,
+        "credit_enabled": bool(product.credit_enabled),
+        "credit_6m_percent": product.credit_6m_percent,
         "config_options": normalize_config_options(product.config_options),
         "images": product.images.split(",") if product.images else [],
     }
@@ -186,6 +201,8 @@ async def create_product(
     price_uz: str = Form(...),
     price_ru: str = Form(...),
     price_en: str = Form(...),
+    credit_enabled: str = Form("false"),
+    credit_6m_percent: str = Form(""),
     config_options: str = Form(""),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -206,6 +223,8 @@ async def create_product(
         price_uz=price_uz,
         price_ru=price_ru,
         price_en=price_en,
+        credit_enabled=int(parse_bool_flag(credit_enabled)),
+        credit_6m_percent=parse_credit_percent(credit_6m_percent) if parse_bool_flag(credit_enabled) else None,
         config_options=dump_config_options(config_options),
         images=",".join(image_urls) if image_urls else None,
     )
@@ -232,6 +251,8 @@ async def update_product(
     price_uz: str = Form(...),
     price_ru: str = Form(...),
     price_en: str = Form(...),
+    credit_enabled: str = Form("false"),
+    credit_6m_percent: str = Form(""),
     config_options: str = Form(""),
     oldImages: List[str] = Form([]),
     files: List[UploadFile] = File(None),
@@ -254,6 +275,10 @@ async def update_product(
     product.price_uz = price_uz
     product.price_ru = price_ru
     product.price_en = price_en
+    product.credit_enabled = int(parse_bool_flag(credit_enabled))
+    product.credit_6m_percent = (
+        parse_credit_percent(credit_6m_percent) if product.credit_enabled else None
+    )
     product.config_options = dump_config_options(config_options)
 
     keep_images = oldImages if oldImages else []

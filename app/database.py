@@ -52,6 +52,8 @@ def _migrate_to_products_only_schema() -> None:
                     price_uz VARCHAR NOT NULL,
                     price_ru VARCHAR NOT NULL,
                     price_en VARCHAR NOT NULL,
+                    credit_enabled INTEGER NOT NULL DEFAULT 0,
+                    credit_6m_percent INTEGER,
                     config_options TEXT,
                     images VARCHAR
                 )
@@ -63,18 +65,24 @@ def _migrate_to_products_only_schema() -> None:
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
-                    price_uz, price_ru, price_en, config_options, images
+                    price_uz, price_ru, price_en, credit_enabled, credit_6m_percent, config_options, images
                 )
                 SELECT
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
-                    price_uz, price_ru, price_en, NULL, images
+                    price_uz, price_ru, price_en, 0, NULL, NULL, images
                 FROM products
                 """
             )
             cursor.execute("DROP TABLE products")
             cursor.execute("ALTER TABLE products_new RENAME TO products")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_enabled"):
+            cursor.execute("ALTER TABLE products ADD COLUMN credit_enabled INTEGER NOT NULL DEFAULT 0")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_6m_percent"):
+            cursor.execute("ALTER TABLE products ADD COLUMN credit_6m_percent INTEGER")
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "config_options"):
             cursor.execute("ALTER TABLE products ADD COLUMN config_options TEXT")
