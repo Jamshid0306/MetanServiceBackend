@@ -52,6 +52,7 @@ def _migrate_to_products_only_schema() -> None:
                     price_uz VARCHAR NOT NULL,
                     price_ru VARCHAR NOT NULL,
                     price_en VARCHAR NOT NULL,
+                    config_options TEXT,
                     images VARCHAR
                 )
                 """
@@ -62,18 +63,21 @@ def _migrate_to_products_only_schema() -> None:
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
-                    price_uz, price_ru, price_en, images
+                    price_uz, price_ru, price_en, config_options, images
                 )
                 SELECT
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
-                    price_uz, price_ru, price_en, images
+                    price_uz, price_ru, price_en, NULL, images
                 FROM products
                 """
             )
             cursor.execute("DROP TABLE products")
             cursor.execute("ALTER TABLE products_new RENAME TO products")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "config_options"):
+            cursor.execute("ALTER TABLE products ADD COLUMN config_options TEXT")
 
         if _table_exists(cursor, "categories"):
             cursor.execute("DROP TABLE categories")

@@ -1,6 +1,7 @@
 import os
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import uuid4
 
 import jwt  # type: ignore
@@ -14,6 +15,7 @@ from ..database import get_db
 
 router = APIRouter()
 security = HTTPBearer()
+OPTION_GROUP_KEYS = ("transmission", "cylinder_volume", "cylinder_position")
 
 
 def save_file(file: UploadFile) -> str:
@@ -37,13 +39,90 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def parse_numeric_price(price: Optional[str]) -> Optional[float]:
-    if not price:
+def parse_numeric_price(price: Optional[Any]) -> Optional[float]:
+    if price is None:
         return None
     digits = "".join(ch for ch in str(price) if ch.isdigit())
     if not digits:
         return None
     return float(digits)
+
+
+def normalize_config_options(raw_options: Optional[Any]) -> dict[str, list[dict[str, Any]]]:
+    options_data: Any = raw_options
+    if isinstance(raw_options, str):
+        if not raw_options.strip():
+            options_data = {}
+        else:
+            try:
+                options_data = json.loads(raw_options)
+            except json.JSONDecodeError:
+                options_data = {}
+
+    if not isinstance(options_data, dict):
+        options_data = {}
+
+    normalized: dict[str, list[dict[str, Any]]] = {key: [] for key in OPTION_GROUP_KEYS}
+    for key in OPTION_GROUP_KEYS:
+        values = options_data.get(key, [])
+        if not isinstance(values, list):
+            continue
+
+        for index, item in enumerate(values):
+            if not isinstance(item, dict):
+                continue
+
+            label = str(item.get("label", "")).strip()
+            if not label:
+                continue
+
+            option_id = str(item.get("id") or f"{key}-{index + 1}").strip()
+            price_delta = parse_numeric_price(item.get("price_delta"))
+
+            normalized[key].append(
+                {
+                    "id": option_id,
+                    "label": label,
+                    "price_delta": int(price_delta or 0),
+                }
+            )
+
+    return normalized
+
+
+def dump_config_options(raw_options: Optional[Any]) -> Optional[str]:
+    normalized = normalize_config_options(raw_options)
+    if not any(normalized.values()):
+        return None
+    return json.dumps(normalized, ensure_ascii=False)
+
+
+def serialize_product(product: models.Product, include_full_details: bool = True) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": product.id,
+        "name_uz": product.name_uz,
+        "name_ru": product.name_ru,
+        "name_en": product.name_en,
+        "price_uz": product.price_uz,
+        "price_ru": product.price_ru,
+        "price_en": product.price_en,
+        "config_options": normalize_config_options(product.config_options),
+        "images": product.images.split(",") if product.images else [],
+    }
+
+    if include_full_details:
+        payload.update(
+            {
+                "description_uz": product.description_uz,
+                "description_ru": product.description_ru,
+                "description_en": product.description_en,
+                "characteristic_uz": product.characteristic_uz,
+                "characteristic_ru": product.characteristic_ru,
+                "characteristic_en": product.characteristic_en,
+            }
+        )
+
+    return payload
 
 
 @router.get("/products")
@@ -56,24 +135,7 @@ def get_products(
 
     result = []
     for p in products:
-        result.append(
-            {
-                "id": p.id,
-                "name_uz": p.name_uz,
-                "name_ru": p.name_ru,
-                "name_en": p.name_en,
-                "description_uz": p.description_uz,
-                "description_ru": p.description_ru,
-                "description_en": p.description_en,
-                "characteristic_uz": p.characteristic_uz,
-                "characteristic_ru": p.characteristic_ru,
-                "characteristic_en": p.characteristic_en,
-                "price_uz": p.price_uz,
-                "price_ru": p.price_ru,
-                "price_en": p.price_en,
-                "images": p.images.split(",") if p.images else [],
-            }
-        )
+        result.append(serialize_product(p))
 
     total = db.query(models.Product).count()
 
@@ -104,16 +166,7 @@ def filter_products(
             if max_price is not None and numeric_price > max_price:
                 continue
         result.append(
-            {
-                "id": p.id,
-                "name_uz": p.name_uz,
-                "name_ru": p.name_ru,
-                "name_en": p.name_en,
-                "price_uz": p.price_uz,
-                "price_ru": p.price_ru,
-                "price_en": p.price_en,
-                "images": p.images.split(",") if p.images else [],
-            }
+            serialize_product(p, include_full_details=False)
         )
 
     return {"products": result}
@@ -133,6 +186,7 @@ async def create_product(
     price_uz: str = Form(...),
     price_ru: str = Form(...),
     price_en: str = Form(...),
+    config_options: str = Form(""),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
@@ -152,6 +206,7 @@ async def create_product(
         price_uz=price_uz,
         price_ru=price_ru,
         price_en=price_en,
+        config_options=dump_config_options(config_options),
         images=",".join(image_urls) if image_urls else None,
     )
 
@@ -177,6 +232,7 @@ async def update_product(
     price_uz: str = Form(...),
     price_ru: str = Form(...),
     price_en: str = Form(...),
+    config_options: str = Form(""),
     oldImages: List[str] = Form([]),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -198,6 +254,7 @@ async def update_product(
     product.price_uz = price_uz
     product.price_ru = price_ru
     product.price_en = price_en
+    product.config_options = dump_config_options(config_options)
 
     keep_images = oldImages if oldImages else []
     new_files = [save_file(file) for file in files] if files else []
@@ -222,22 +279,7 @@ def get_product_detail(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    return {
-        "id": product.id,
-        "name_uz": product.name_uz,
-        "name_ru": product.name_ru,
-        "name_en": product.name_en,
-        "description_uz": product.description_uz,
-        "description_ru": product.description_ru,
-        "description_en": product.description_en,
-        "characteristic_uz": product.characteristic_uz,
-        "characteristic_ru": product.characteristic_ru,
-        "characteristic_en": product.characteristic_en,
-        "price_uz": product.price_uz,
-        "price_ru": product.price_ru,
-        "price_en": product.price_en,
-        "images": product.images.split(",") if product.images else [],
-    }
+    return serialize_product(product)
 
 
 @router.delete("/{product_id}")

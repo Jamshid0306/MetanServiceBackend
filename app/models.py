@@ -18,4 +18,5 @@ class Product(Base):
     price_uz = Column(String, nullable=False)
     price_ru = Column(String, nullable=False)
     price_en = Column(String, nullable=False)
+    config_options = Column(Text, nullable=True)
     images = Column(String, nullable=True)
