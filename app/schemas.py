@@ -1,5 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Union
+
+class CreditPlan(BaseModel):
+    months: int
+    percent: int
 
 class ProductBase(BaseModel):
     price_uz: Union[str, float]
@@ -17,6 +21,7 @@ class ProductBase(BaseModel):
     credit_enabled: bool = False
     credit_months: Optional[int] = None
     credit_percent: Optional[int] = None
+    credit_plans: List[CreditPlan] = Field(default_factory=list)
     images: List[str]
 
 class ProductCreate(ProductBase):

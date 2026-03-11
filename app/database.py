@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -56,6 +57,7 @@ def _migrate_to_products_only_schema() -> None:
                     credit_months INTEGER,
                     credit_percent INTEGER,
                     credit_6m_percent INTEGER,
+                    credit_plans TEXT,
                     config_options TEXT,
                     images VARCHAR
                 )
@@ -68,7 +70,7 @@ def _migrate_to_products_only_schema() -> None:
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
                     price_uz, price_ru, price_en,
-                    credit_enabled, credit_months, credit_percent, credit_6m_percent,
+                    credit_enabled, credit_months, credit_percent, credit_6m_percent, credit_plans,
                     config_options, images
                 )
                 SELECT
@@ -76,7 +78,7 @@ def _migrate_to_products_only_schema() -> None:
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
                     price_uz, price_ru, price_en,
-                    0, NULL, NULL, NULL, NULL, images
+                    0, NULL, NULL, NULL, NULL, NULL, images
                 FROM products
                 """
             )
@@ -94,6 +96,9 @@ def _migrate_to_products_only_schema() -> None:
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_6m_percent"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_6m_percent INTEGER")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_plans"):
+            cursor.execute("ALTER TABLE products ADD COLUMN credit_plans TEXT")
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "config_options"):
             cursor.execute("ALTER TABLE products ADD COLUMN config_options TEXT")
@@ -113,6 +118,48 @@ def _migrate_to_products_only_schema() -> None:
                 WHERE credit_percent IS NULL
                 """
             )
+
+            cursor.execute(
+                """
+                SELECT id, credit_months, credit_percent, credit_6m_percent, credit_plans
+                FROM products
+                """
+            )
+            rows = cursor.fetchall()
+
+            for product_id, credit_months, credit_percent, credit_6m_percent, credit_plans in rows:
+                if str(credit_plans or "").strip():
+                    continue
+
+                plans = []
+                seen_months = set()
+
+                if credit_months is not None and credit_percent is not None:
+                    month_value = int(credit_months)
+                    plans.append(
+                        {
+                            "months": month_value,
+                            "percent": int(credit_percent),
+                        }
+                    )
+                    seen_months.add(month_value)
+
+                if credit_6m_percent is not None and 6 not in seen_months:
+                    plans.append(
+                        {
+                            "months": 6,
+                            "percent": int(credit_6m_percent),
+                        }
+                    )
+
+                if not plans:
+                    continue
+
+                plans.sort(key=lambda item: item["months"])
+                cursor.execute(
+                    "UPDATE products SET credit_plans = ? WHERE id = ?",
+                    (json.dumps(plans, ensure_ascii=False), product_id),
+                )
 
         if _table_exists(cursor, "categories"):
             cursor.execute("DROP TABLE categories")

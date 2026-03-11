@@ -22,5 +22,6 @@ class Product(Base):
     credit_months = Column(Integer, nullable=True)
     credit_percent = Column(Integer, nullable=True)
     credit_6m_percent = Column(Integer, nullable=True)
+    credit_plans = Column(Text, nullable=True)
     config_options = Column(Text, nullable=True)
     images = Column(String, nullable=True)

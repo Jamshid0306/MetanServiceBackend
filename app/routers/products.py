@@ -17,7 +17,8 @@ from ..orders_database import save_order
 
 router = APIRouter()
 security = HTTPBearer()
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
+DEFAULT_FUEL_TYPE_LABEL = "Standart"
 DEFAULT_TRANSMISSION_LABEL = "Standart"
 DEFAULT_GENERATION_LABEL = "Standart"
 SUMMARY_PRODUCT_COLUMNS = (
@@ -32,6 +33,7 @@ SUMMARY_PRODUCT_COLUMNS = (
     models.Product.credit_months,
     models.Product.credit_percent,
     models.Product.credit_6m_percent,
+    models.Product.credit_plans,
     models.Product.config_options,
     models.Product.images,
 )
@@ -89,7 +91,75 @@ def parse_credit_months(value: Optional[Any]) -> Optional[int]:
     return months if months > 0 else None
 
 
-def resolve_credit_fields(product: models.Product) -> tuple[Optional[int], Optional[int]]:
+def normalize_credit_plan_item(item: Any) -> Optional[dict[str, int]]:
+    if not isinstance(item, dict):
+        return None
+
+    months = parse_credit_months(item.get("months"))
+    percent = parse_credit_percent(item.get("percent"))
+
+    if months is None or percent is None:
+        return None
+
+    return {
+        "months": months,
+        "percent": percent,
+    }
+
+
+def normalize_credit_plans(raw_plans: Optional[Any]) -> list[dict[str, int]]:
+    source: Any = raw_plans
+
+    if isinstance(raw_plans, str):
+        if not raw_plans.strip():
+            source = []
+        else:
+            try:
+                source = json.loads(raw_plans)
+            except json.JSONDecodeError:
+                source = []
+
+    if not isinstance(source, list):
+        return []
+
+    normalized: list[dict[str, int]] = []
+    seen_months: set[int] = set()
+
+    for item in source:
+        plan = normalize_credit_plan_item(item)
+        if not plan or plan["months"] in seen_months:
+            continue
+
+        normalized.append(plan)
+        seen_months.add(plan["months"])
+
+    normalized.sort(key=lambda plan: plan["months"])
+    return normalized
+
+
+def dump_credit_plans(raw_plans: Optional[Any]) -> Optional[str]:
+    normalized = normalize_credit_plans(raw_plans)
+    if not normalized:
+        return None
+
+    return json.dumps(normalized, ensure_ascii=False)
+
+
+def resolve_legacy_credit_plans(product: models.Product) -> list[dict[str, int]]:
+    plans: list[dict[str, int]] = []
+    seen_months: set[int] = set()
+
+    primary_months = parse_credit_months(product.credit_months)
+    primary_percent = parse_credit_percent(product.credit_percent)
+    if primary_months is not None and primary_percent is not None:
+        plans.append(
+            {
+                "months": primary_months,
+                "percent": primary_percent,
+            }
+        )
+        seen_months.add(primary_months)
+
     credit_percent = product.credit_percent
     legacy_credit_percent = product.credit_6m_percent
 
@@ -100,7 +170,47 @@ def resolve_credit_fields(product: models.Product) -> tuple[Optional[int], Optio
     if credit_months is None and credit_percent is not None:
         credit_months = 6
 
-    return credit_months, credit_percent
+    if (
+        credit_months is not None
+        and credit_percent is not None
+        and credit_months not in seen_months
+    ):
+        plans.append(
+            {
+                "months": int(credit_months),
+                "percent": int(credit_percent),
+            }
+        )
+        seen_months.add(int(credit_months))
+
+    six_month_percent = parse_credit_percent(product.credit_6m_percent)
+    if six_month_percent is not None and 6 not in seen_months:
+        plans.append(
+            {
+                "months": 6,
+                "percent": six_month_percent,
+            }
+        )
+
+    plans.sort(key=lambda plan: plan["months"])
+    return plans
+
+
+def load_credit_plans(product: models.Product) -> list[dict[str, int]]:
+    plans = normalize_credit_plans(product.credit_plans)
+    if plans:
+        return plans
+
+    return resolve_legacy_credit_plans(product)
+
+
+def resolve_credit_fields(product: models.Product) -> tuple[Optional[int], Optional[int]]:
+    plans = load_credit_plans(product)
+    if not plans:
+        return None, None
+
+    primary_plan = plans[0]
+    return primary_plan["months"], primary_plan["percent"]
 
 
 def _parse_config_source(raw_options: Optional[Any]) -> dict[str, Any]:
@@ -254,6 +364,52 @@ def _normalize_transmission_list(
     return normalized
 
 
+def _normalize_fuel_type_item(
+    item: Any,
+    index: int,
+    prefix: str,
+    fallback_transmissions: Optional[list[dict[str, Any]]] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+
+    label = str(item.get("label", "")).strip()
+    if not label:
+        return None
+
+    option_id = str(item.get("id") or f"{prefix}-{index + 1}").strip()
+    raw_transmissions = item.get("transmissions")
+    transmissions = (
+        _normalize_transmission_list(raw_transmissions, f"{option_id}-transmission")
+        if isinstance(raw_transmissions, list)
+        else [dict(transmission) for transmission in (fallback_transmissions or [])]
+    )
+
+    return {
+        "id": option_id,
+        "label": label,
+        "hidden": bool(item.get("hidden")),
+        "transmissions": transmissions,
+    }
+
+
+def _normalize_fuel_type_list(
+    values: Any,
+    prefix: str,
+    fallback_transmissions: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(values):
+        option = _normalize_fuel_type_item(item, index, prefix, fallback_transmissions)
+        if option:
+            normalized.append(option)
+
+    return normalized
+
+
 def _create_synthetic_generation(volumes: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "id": "generation-default",
@@ -271,6 +427,15 @@ def _create_synthetic_transmission(generations: list[dict[str, Any]]) -> dict[st
         "hidden": True,
         "price_delta": 0,
         "generations": [dict(generation) for generation in generations],
+    }
+
+
+def _create_synthetic_fuel_type(transmissions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "id": "fuel-type-default",
+        "label": DEFAULT_FUEL_TYPE_LABEL,
+        "hidden": True,
+        "transmissions": [dict(transmission) for transmission in transmissions],
     }
 
 
@@ -293,31 +458,35 @@ def _normalize_legacy_config(source: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
     if legacy_transmissions:
-        return legacy_transmissions
+        return [_create_synthetic_fuel_type(legacy_transmissions)]
 
     if fallback_generations:
-        return [_create_synthetic_transmission(fallback_generations)]
+        return [_create_synthetic_fuel_type([_create_synthetic_transmission(fallback_generations)])]
+
+    direct_transmissions = _normalize_transmission_list(source.get("transmissions"), "transmission")
+    if direct_transmissions:
+        return [_create_synthetic_fuel_type(direct_transmissions)]
 
     return []
 
 
 def normalize_config_options(raw_options: Optional[Any]) -> dict[str, Any]:
     options_data = _parse_config_source(raw_options)
-    transmissions = (
-        _normalize_transmission_list(options_data.get("transmissions"), "transmission")
-        if isinstance(options_data.get("transmissions"), list)
+    fuel_types = (
+        _normalize_fuel_type_list(options_data.get("fuel_types"), "fuel-type")
+        if isinstance(options_data.get("fuel_types"), list)
         else _normalize_legacy_config(options_data)
     )
 
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
-        "transmissions": transmissions,
+        "fuel_types": fuel_types,
     }
 
 
 def dump_config_options(raw_options: Optional[Any]) -> Optional[str]:
     normalized = normalize_config_options(raw_options)
-    if not normalized["transmissions"]:
+    if not normalized["fuel_types"]:
         return None
     return json.dumps(normalized, ensure_ascii=False)
 
@@ -331,6 +500,7 @@ class OrderPayload(BaseModel):
 
 
 def serialize_product(product: models.Product, include_full_details: bool = True) -> dict[str, Any]:
+    credit_plans = load_credit_plans(product)
     credit_months, credit_percent = resolve_credit_fields(product)
     payload: dict[str, Any] = {
         "id": product.id,
@@ -344,6 +514,7 @@ def serialize_product(product: models.Product, include_full_details: bool = True
         "credit_months": credit_months,
         "credit_percent": credit_percent,
         "credit_6m_percent": product.credit_6m_percent,
+        "credit_plans": credit_plans,
         "config_options": normalize_config_options(product.config_options),
         "images": product.images.split(",") if product.images else [],
     }
@@ -435,6 +606,7 @@ async def create_product(
     price_ru: str = Form(...),
     price_en: str = Form(...),
     credit_enabled: str = Form("false"),
+    credit_plans: str = Form(""),
     credit_months: str = Form(""),
     credit_percent: str = Form(""),
     credit_6m_percent: str = Form(""),
@@ -445,11 +617,27 @@ async def create_product(
 ):
     image_urls = [save_file(file) for file in files] if files else []
     is_credit_enabled = parse_bool_flag(credit_enabled)
-    parsed_credit_percent = parse_credit_percent(credit_percent or credit_6m_percent)
-    parsed_credit_months = parse_credit_months(credit_months)
+    parsed_credit_plans = normalize_credit_plans(credit_plans)
 
-    if is_credit_enabled and (parsed_credit_months is None or parsed_credit_percent is None):
-        raise HTTPException(status_code=400, detail="Credit months and percent are required")
+    if not parsed_credit_plans:
+        parsed_credit_percent = parse_credit_percent(credit_percent or credit_6m_percent)
+        parsed_credit_months = parse_credit_months(credit_months)
+        if parsed_credit_months is not None and parsed_credit_percent is not None:
+            parsed_credit_plans = [
+                {
+                    "months": parsed_credit_months,
+                    "percent": parsed_credit_percent,
+                }
+            ]
+
+    if is_credit_enabled and not parsed_credit_plans:
+        raise HTTPException(status_code=400, detail="At least one credit plan is required")
+
+    primary_credit_plan = parsed_credit_plans[0] if parsed_credit_plans else None
+    six_month_plan = next(
+        (plan for plan in parsed_credit_plans if plan["months"] == 6),
+        None,
+    )
 
     new_product = models.Product(
         name_uz=name_uz,
@@ -465,13 +653,14 @@ async def create_product(
         price_ru=price_ru,
         price_en=price_en,
         credit_enabled=int(is_credit_enabled),
-        credit_months=parsed_credit_months if is_credit_enabled else None,
-        credit_percent=parsed_credit_percent if is_credit_enabled else None,
+        credit_months=primary_credit_plan["months"] if is_credit_enabled and primary_credit_plan else None,
+        credit_percent=primary_credit_plan["percent"] if is_credit_enabled and primary_credit_plan else None,
         credit_6m_percent=(
-            parsed_credit_percent
-            if is_credit_enabled and parsed_credit_months == 6
+            six_month_plan["percent"]
+            if is_credit_enabled and six_month_plan
             else None
         ),
+        credit_plans=dump_credit_plans(parsed_credit_plans) if is_credit_enabled else None,
         config_options=dump_config_options(config_options),
         images=",".join(image_urls) if image_urls else None,
     )
@@ -499,6 +688,7 @@ async def update_product(
     price_ru: str = Form(...),
     price_en: str = Form(...),
     credit_enabled: str = Form("false"),
+    credit_plans: str = Form(""),
     credit_months: str = Form(""),
     credit_percent: str = Form(""),
     credit_6m_percent: str = Form(""),
@@ -513,11 +703,27 @@ async def update_product(
         raise HTTPException(status_code=404, detail="Product not found")
 
     is_credit_enabled = parse_bool_flag(credit_enabled)
-    parsed_credit_percent = parse_credit_percent(credit_percent or credit_6m_percent)
-    parsed_credit_months = parse_credit_months(credit_months)
+    parsed_credit_plans = normalize_credit_plans(credit_plans)
 
-    if is_credit_enabled and (parsed_credit_months is None or parsed_credit_percent is None):
-        raise HTTPException(status_code=400, detail="Credit months and percent are required")
+    if not parsed_credit_plans:
+        parsed_credit_percent = parse_credit_percent(credit_percent or credit_6m_percent)
+        parsed_credit_months = parse_credit_months(credit_months)
+        if parsed_credit_months is not None and parsed_credit_percent is not None:
+            parsed_credit_plans = [
+                {
+                    "months": parsed_credit_months,
+                    "percent": parsed_credit_percent,
+                }
+            ]
+
+    if is_credit_enabled and not parsed_credit_plans:
+        raise HTTPException(status_code=400, detail="At least one credit plan is required")
+
+    primary_credit_plan = parsed_credit_plans[0] if parsed_credit_plans else None
+    six_month_plan = next(
+        (plan for plan in parsed_credit_plans if plan["months"] == 6),
+        None,
+    )
 
     product.name_uz = name_uz
     product.name_ru = name_ru
@@ -532,13 +738,18 @@ async def update_product(
     product.price_ru = price_ru
     product.price_en = price_en
     product.credit_enabled = int(is_credit_enabled)
-    product.credit_months = parsed_credit_months if product.credit_enabled else None
-    product.credit_percent = parsed_credit_percent if product.credit_enabled else None
+    product.credit_months = (
+        primary_credit_plan["months"] if product.credit_enabled and primary_credit_plan else None
+    )
+    product.credit_percent = (
+        primary_credit_plan["percent"] if product.credit_enabled and primary_credit_plan else None
+    )
     product.credit_6m_percent = (
-        parsed_credit_percent
-        if product.credit_enabled and parsed_credit_months == 6
+        six_month_plan["percent"]
+        if product.credit_enabled and six_month_plan
         else None
     )
+    product.credit_plans = dump_credit_plans(parsed_credit_plans) if product.credit_enabled else None
     product.config_options = dump_config_options(config_options)
 
     keep_images = oldImages if oldImages else []
