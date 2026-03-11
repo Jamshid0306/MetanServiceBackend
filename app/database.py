@@ -53,6 +53,8 @@ def _migrate_to_products_only_schema() -> None:
                     price_ru VARCHAR NOT NULL,
                     price_en VARCHAR NOT NULL,
                     credit_enabled INTEGER NOT NULL DEFAULT 0,
+                    credit_months INTEGER,
+                    credit_percent INTEGER,
                     credit_6m_percent INTEGER,
                     config_options TEXT,
                     images VARCHAR
@@ -65,13 +67,16 @@ def _migrate_to_products_only_schema() -> None:
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
-                    price_uz, price_ru, price_en, credit_enabled, credit_6m_percent, config_options, images
+                    price_uz, price_ru, price_en,
+                    credit_enabled, credit_months, credit_percent, credit_6m_percent,
+                    config_options, images
                 )
                 SELECT
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
-                    price_uz, price_ru, price_en, 0, NULL, NULL, images
+                    price_uz, price_ru, price_en,
+                    0, NULL, NULL, NULL, NULL, images
                 FROM products
                 """
             )
@@ -81,11 +86,33 @@ def _migrate_to_products_only_schema() -> None:
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_enabled"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_enabled INTEGER NOT NULL DEFAULT 0")
 
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_months"):
+            cursor.execute("ALTER TABLE products ADD COLUMN credit_months INTEGER")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_percent"):
+            cursor.execute("ALTER TABLE products ADD COLUMN credit_percent INTEGER")
+
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_6m_percent"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_6m_percent INTEGER")
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "config_options"):
             cursor.execute("ALTER TABLE products ADD COLUMN config_options TEXT")
+
+        if _table_exists(cursor, "products"):
+            cursor.execute(
+                """
+                UPDATE products
+                SET credit_months = COALESCE(credit_months, CASE WHEN credit_6m_percent IS NOT NULL THEN 6 END)
+                WHERE credit_months IS NULL
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE products
+                SET credit_percent = COALESCE(credit_percent, credit_6m_percent)
+                WHERE credit_percent IS NULL
+                """
+            )
 
         if _table_exists(cursor, "categories"):
             cursor.execute("DROP TABLE categories")

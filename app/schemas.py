@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Union
+from typing import List, Optional, Union
 
 class ProductBase(BaseModel):
     price_uz: Union[str, float]
@@ -14,6 +14,9 @@ class ProductBase(BaseModel):
     characteristic_uz: str
     characteristic_ru: str
     characteristic_en: str
+    credit_enabled: bool = False
+    credit_months: Optional[int] = None
+    credit_percent: Optional[int] = None
     images: List[str]
 
 class ProductCreate(ProductBase):
