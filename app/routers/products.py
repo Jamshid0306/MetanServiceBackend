@@ -5,13 +5,25 @@ from typing import Any, List, Optional
 from uuid import uuid4
 
 import jwt  # type: ignore
+import requests  # type: ignore
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Security, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
 
 from .. import models
-from ..config import BACKEND_DIR, IMAGES_DIR, SECRET_KEY
+from ..config import (
+    BACKEND_DIR,
+    ICAN_CREDIT_API_URL,
+    ICAN_CREDIT_COMPANY_ID,
+    ICAN_CREDIT_CREATE_PATH,
+    ICAN_CREDIT_DEFAULT_PAYMENT_DAY,
+    ICAN_CREDIT_EMPLOYEE_ID,
+    ICAN_CREDIT_PASSWORD,
+    ICAN_CREDIT_USERNAME,
+    IMAGES_DIR,
+    SECRET_KEY,
+)
 from ..database import get_db
 from ..orders_database import save_order
 
@@ -89,6 +101,190 @@ def parse_credit_months(value: Optional[Any]) -> Optional[int]:
 
     months = int(parsed)
     return months if months > 0 else None
+
+
+def normalize_phone_number(value: Any) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return ""
+
+    if digits.startswith("998") and len(digits) == 12:
+        return digits
+
+    if len(digits) == 9:
+        return f"998{digits}"
+
+    if len(digits) == 12:
+        return digits
+
+    return digits
+
+
+def normalize_phone_list(values: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        phone = normalize_phone_number(value)
+        if not phone or phone in seen:
+            continue
+        normalized.append(phone)
+        seen.add(phone)
+
+    return normalized
+
+
+def normalize_ican_gender(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"m", "male", "erkak", "man", "м"}:
+        return "male"
+    if normalized in {"f", "female", "ayol", "woman", "ж", "j"}:
+        return "female"
+    return normalized
+
+
+def build_products_note(products: list[dict[str, Any]]) -> str:
+    notes: list[str] = []
+    for product in products:
+        name = str(product.get("name") or product.get("id") or "Product").strip()
+        quantity = int(product.get("quantity") or 1)
+        selected_options = product.get("selected_options") or []
+        option_labels = [
+            str(option.get("label")).strip()
+            for option in selected_options
+            if isinstance(option, dict) and str(option.get("label") or "").strip()
+        ]
+
+        note = f"{name} x{quantity}"
+        if option_labels:
+            note += f" ({', '.join(option_labels)})"
+        notes.append(note)
+
+    return "; ".join(notes)
+
+
+def extract_upstream_error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        for key in ("detail", "message", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        errors = payload.get("errors")
+        if isinstance(errors, dict):
+            parts: list[str] = []
+            for field, value in errors.items():
+                if isinstance(value, list):
+                    text = ", ".join(str(item).strip() for item in value if str(item).strip())
+                else:
+                    text = str(value).strip()
+                if text:
+                    parts.append(f"{field}: {text}")
+            if parts:
+                return "; ".join(parts)
+
+    text = response.text.strip()
+    if text:
+        return text[:500]
+
+    return "Credit service request failed."
+
+
+def submit_ican_credit_request(
+    credit_payload: "CreditOrderPayload",
+    products: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
+        raise HTTPException(
+            status_code=500,
+            detail="ICAN credit integration credentials are not configured",
+        )
+
+    if credit_payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="Credit amount must be greater than zero")
+
+    if credit_payload.period <= 0:
+        raise HTTPException(status_code=400, detail="Credit period must be greater than zero")
+
+    phones = normalize_phone_list(credit_payload.phones)
+    if not phones:
+        raise HTTPException(status_code=400, detail="At least one valid phone number is required")
+
+    payment_day = int(credit_payload.start_date.split("-")[-1]) if credit_payload.start_date else 0
+    if payment_day <= 0:
+        payment_day = ICAN_CREDIT_DEFAULT_PAYMENT_DAY
+
+    form_data: dict[str, Any] = {
+        "credit___company_id": ICAN_CREDIT_COMPANY_ID,
+        "credit___employee_id": ICAN_CREDIT_EMPLOYEE_ID,
+        "credit___tariff_id": credit_payload.tariff_id,
+        "credit___amount": credit_payload.amount,
+        "credit___initial_payment": credit_payload.initial_payment,
+        "credit___period": credit_payload.period,
+        "credit___payment_day": payment_day,
+        "credit___start_date": credit_payload.start_date,
+        "credit___products_note": build_products_note(products),
+        "credit___comment": f"Website order for product IDs: {', '.join(str(product.get('id')) for product in products if product.get('id'))}",
+        "user_document___passport": credit_payload.passport,
+        "user_document___pinfl": credit_payload.pinfl,
+        "user_document___last_name": credit_payload.last_name,
+        "user_document___first_name": credit_payload.first_name,
+        "user_document___middle_name": credit_payload.middle_name,
+        "user_document___gender": normalize_ican_gender(credit_payload.gender),
+        "user_document___birth_date": credit_payload.birth_date,
+        "person_main___district_id": credit_payload.district_id,
+    }
+
+    if credit_payload.region_id is not None:
+        form_data["person_main___region_id"] = credit_payload.region_id
+
+    for index, phone in enumerate(phones):
+        form_data[f"person_main___phones[{index}]"] = phone
+
+    credit_url = f"{ICAN_CREDIT_API_URL}{ICAN_CREDIT_CREATE_PATH}"
+
+    try:
+        response = requests.post(
+            credit_url,
+            data=form_data,
+            auth=(ICAN_CREDIT_USERNAME, ICAN_CREDIT_PASSWORD),
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "ru",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ICAN credit service is unavailable: {exc}",
+        ) from exc
+
+    if response.status_code >= 400:
+        detail = extract_upstream_error_detail(response)
+        status_code = 400 if response.status_code < 500 else 502
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit service returned an invalid response",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit service returned an unexpected response",
+        )
+
+    return payload
 
 
 def normalize_credit_plan_item(item: Any) -> Optional[dict[str, int]]:
@@ -491,12 +687,32 @@ def dump_config_options(raw_options: Optional[Any]) -> Optional[str]:
     return json.dumps(normalized, ensure_ascii=False)
 
 
+class CreditOrderPayload(BaseModel):
+    tariff_id: int
+    amount: float
+    initial_payment: float = 0
+    period: int
+    start_date: str
+    passport: str
+    pinfl: str
+    last_name: str
+    first_name: str
+    middle_name: str
+    gender: str
+    birth_date: str
+    region_id: Optional[int] = None
+    district_id: int
+    phones: List[str] = Field(default_factory=list)
+
+
 class OrderPayload(BaseModel):
     name: str
     phone: str
-    products: List[dict[str, Any]]
+    products: List[dict[str, Any]] = Field(default_factory=list)
     total: float = 0
     locale: str = "uz"
+    order_type: str = "standard"
+    credit: Optional[CreditOrderPayload] = None
 
 
 def serialize_product(product: models.Product, include_full_details: bool = True) -> dict[str, Any]:
@@ -784,9 +1000,24 @@ def create_order(payload: OrderPayload):
     phone = payload.phone.strip()
     products = payload.products or []
     phone_digits = "".join(ch for ch in phone if ch.isdigit())
+    order_type = (payload.order_type or "standard").strip().lower()
 
     if not name or not phone or len(phone_digits) < 9 or not products:
         raise HTTPException(status_code=400, detail="Name, phone and products are required")
+
+    if order_type not in {"standard", "credit"}:
+        raise HTTPException(status_code=400, detail="Unsupported order type")
+
+    response_payload: dict[str, Any] = {
+        "success": True,
+        "order_type": order_type,
+    }
+
+    if order_type == "credit":
+        if payload.credit is None:
+            raise HTTPException(status_code=400, detail="Credit order data is required")
+
+        response_payload["credit"] = submit_ican_credit_request(payload.credit, products)
 
     save_order(
         name=name,
@@ -796,7 +1027,7 @@ def create_order(payload: OrderPayload):
         locale=(payload.locale or "uz").strip() or "uz",
     )
 
-    return {"success": True}
+    return response_payload
 
 
 @router.delete("/{product_id}")

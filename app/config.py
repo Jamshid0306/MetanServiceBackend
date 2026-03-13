@@ -16,6 +16,17 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
 
 
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 DEFAULT_PROD_HOSTS = [
     "urganchmetanservice.uz",
     "www.urganchmetanservice.uz",
@@ -38,3 +49,10 @@ CORS_ORIGINS = list(dict.fromkeys([*DEFAULT_CORS_ORIGINS, *configured_cors_origi
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key_here")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ICAN_CREDIT_API_URL = os.getenv("ICAN_CREDIT_API_URL", "https://api.credit.icangroup.uz").rstrip("/")
+ICAN_CREDIT_CREATE_PATH = os.getenv("ICAN_CREDIT_CREATE_PATH", "/external/ican/credit/create")
+ICAN_CREDIT_USERNAME = os.getenv("ICAN_CREDIT_USERNAME", "")
+ICAN_CREDIT_PASSWORD = os.getenv("ICAN_CREDIT_PASSWORD", "")
+ICAN_CREDIT_COMPANY_ID = _env_int("ICAN_CREDIT_COMPANY_ID", 1)
+ICAN_CREDIT_EMPLOYEE_ID = _env_int("ICAN_CREDIT_EMPLOYEE_ID", 4)
+ICAN_CREDIT_DEFAULT_PAYMENT_DAY = _env_int("ICAN_CREDIT_DEFAULT_PAYMENT_DAY", 5)
