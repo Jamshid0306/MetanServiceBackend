@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import CORS_ORIGINS, STATIC_DIR
 from .database import init_db
-from .routers import admin, products
+from .routers import admin, hero_slides, products
 
 app = FastAPI(title="Shop API")
 
@@ -25,3 +25,4 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(products.router, prefix="/products", tags=["Products"])
 app.include_router(admin.router, prefix="/admin", tags=["Admin"])
+app.include_router(hero_slides.router, prefix="/hero-slides", tags=["Hero Slides"])

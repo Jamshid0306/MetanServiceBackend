@@ -1,4 +1,6 @@
-from sqlalchemy import Column, Integer, String, Text
+from datetime import datetime
+
+from sqlalchemy import Column, DateTime, Integer, String, Text
 
 from .database import Base
 
@@ -15,6 +17,7 @@ class Product(Base):
     characteristic_uz = Column(Text)
     characteristic_ru = Column(Text)
     characteristic_en = Column(Text)
+    default_price = Column(String, nullable=True)
     price_uz = Column(String, nullable=False)
     price_ru = Column(String, nullable=False)
     price_en = Column(String, nullable=False)
@@ -25,3 +28,13 @@ class Product(Base):
     credit_plans = Column(Text, nullable=True)
     config_options = Column(Text, nullable=True)
     images = Column(String, nullable=True)
+
+
+class HeroSlide(Base):
+    __tablename__ = "hero_slides"
+
+    id = Column(Integer, primary_key=True)
+    image_path = Column(String, nullable=False)
+    duration_days = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)

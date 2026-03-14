@@ -4,14 +4,13 @@ from pathlib import Path
 from typing import Any, List, Optional
 from uuid import uuid4
 
-import jwt  # type: ignore
 import requests  # type: ignore
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Security, UploadFile
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
 
 from .. import models
+from ..auth import verify_token
 from ..config import (
     BACKEND_DIR,
     ICAN_CREDIT_API_URL,
@@ -22,14 +21,12 @@ from ..config import (
     ICAN_CREDIT_PASSWORD,
     ICAN_CREDIT_USERNAME,
     IMAGES_DIR,
-    SECRET_KEY,
 )
 from ..database import get_db
 from ..orders_database import save_order
 
 router = APIRouter()
-security = HTTPBearer()
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 DEFAULT_FUEL_TYPE_LABEL = "Standart"
 DEFAULT_TRANSMISSION_LABEL = "Standart"
 DEFAULT_GENERATION_LABEL = "Standart"
@@ -38,6 +35,7 @@ SUMMARY_PRODUCT_COLUMNS = (
     models.Product.name_uz,
     models.Product.name_ru,
     models.Product.name_en,
+    models.Product.default_price,
     models.Product.price_uz,
     models.Product.price_ru,
     models.Product.price_en,
@@ -59,18 +57,6 @@ def save_file(file: UploadFile) -> str:
     with filepath.open("wb") as buffer:
         buffer.write(file.file.read())
     return f"/static/images/{filename}"
-
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
 
 def parse_numeric_price(price: Optional[Any]) -> Optional[float]:
     if price is None:
@@ -101,6 +87,18 @@ def parse_credit_months(value: Optional[Any]) -> Optional[int]:
 
     months = int(parsed)
     return months if months > 0 else None
+
+
+def parse_option_count(
+    value: Optional[Any],
+    default: Optional[int] = None,
+) -> Optional[int]:
+    parsed = parse_numeric_price(value)
+    if parsed is None:
+        return default
+
+    count = int(parsed)
+    return count if count > 0 else default
 
 
 def normalize_phone_number(value: Any) -> str:
@@ -150,7 +148,16 @@ def build_products_note(products: list[dict[str, Any]]) -> str:
         quantity = int(product.get("quantity") or 1)
         selected_options = product.get("selected_options") or []
         option_labels = [
-            str(option.get("label")).strip()
+            (
+                f"{str(option.get('label')).strip()} x{count} ta"
+                if (
+                    isinstance(option, dict)
+                    and str(option.get("group_key") or "").strip() == "cylinder_volume"
+                    and (count := parse_option_count(option.get("count"))) is not None
+                    and count > 1
+                )
+                else str(option.get("label")).strip()
+            )
             for option in selected_options
             if isinstance(option, dict) and str(option.get("label") or "").strip()
         ]
@@ -440,10 +447,12 @@ def _normalize_cylinder_volume_item(
 
     option_id = str(item.get("id") or f"{prefix}-{index + 1}").strip()
     price_delta = parse_numeric_price(item.get("price_delta"))
+    count = parse_option_count(item.get("count"), 1)
 
     return {
         "id": option_id,
         "label": label,
+        "count": count,
         "price_delta": int(price_delta or 0),
     }
 
@@ -723,6 +732,7 @@ def serialize_product(product: models.Product, include_full_details: bool = True
         "name_uz": product.name_uz,
         "name_ru": product.name_ru,
         "name_en": product.name_en,
+        "default_price": product.default_price,
         "price_uz": product.price_uz,
         "price_ru": product.price_ru,
         "price_en": product.price_en,
@@ -818,6 +828,7 @@ async def create_product(
     characteristic_uz: str = Form(None),
     characteristic_ru: str = Form(None),
     characteristic_en: str = Form(None),
+    default_price: str = Form(""),
     price_uz: str = Form(...),
     price_ru: str = Form(...),
     price_en: str = Form(...),
@@ -865,6 +876,7 @@ async def create_product(
         characteristic_uz=characteristic_uz,
         characteristic_ru=characteristic_ru,
         characteristic_en=characteristic_en,
+        default_price=default_price.strip() if isinstance(default_price, str) else default_price,
         price_uz=price_uz,
         price_ru=price_ru,
         price_en=price_en,
@@ -900,6 +912,7 @@ async def update_product(
     characteristic_uz: str = Form(...),
     characteristic_ru: str = Form(...),
     characteristic_en: str = Form(...),
+    default_price: str = Form(""),
     price_uz: str = Form(...),
     price_ru: str = Form(...),
     price_en: str = Form(...),
@@ -950,6 +963,7 @@ async def update_product(
     product.characteristic_uz = characteristic_uz
     product.characteristic_ru = characteristic_ru
     product.characteristic_en = characteristic_en
+    product.default_price = default_price.strip() if isinstance(default_price, str) else default_price
     product.price_uz = price_uz
     product.price_ru = price_ru
     product.price_en = price_en

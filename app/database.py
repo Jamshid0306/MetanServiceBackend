@@ -50,6 +50,7 @@ def _migrate_to_products_only_schema() -> None:
                     characteristic_uz TEXT,
                     characteristic_ru TEXT,
                     characteristic_en TEXT,
+                    default_price VARCHAR,
                     price_uz VARCHAR NOT NULL,
                     price_ru VARCHAR NOT NULL,
                     price_en VARCHAR NOT NULL,
@@ -69,6 +70,7 @@ def _migrate_to_products_only_schema() -> None:
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
+                    default_price,
                     price_uz, price_ru, price_en,
                     credit_enabled, credit_months, credit_percent, credit_6m_percent, credit_plans,
                     config_options, images
@@ -77,6 +79,7 @@ def _migrate_to_products_only_schema() -> None:
                     id, name_uz, name_ru, name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
+                    NULL,
                     price_uz, price_ru, price_en,
                     0, NULL, NULL, NULL, NULL, NULL, images
                 FROM products
@@ -87,6 +90,9 @@ def _migrate_to_products_only_schema() -> None:
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_enabled"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_enabled INTEGER NOT NULL DEFAULT 0")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "default_price"):
+            cursor.execute("ALTER TABLE products ADD COLUMN default_price VARCHAR")
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_months"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_months INTEGER")
