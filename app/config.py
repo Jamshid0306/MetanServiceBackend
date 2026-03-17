@@ -37,6 +37,7 @@ DEFAULT_PROD_HOSTS = [
 DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://127.0.0.1:4173",
     "http://localhost:4173",
     *[f"https://{host}" for host in DEFAULT_PROD_HOSTS],
@@ -51,6 +52,8 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES = _env_int("ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES", 1440)
 ADMIN_REFRESH_TOKEN_EXPIRE_DAYS = _env_int("ADMIN_REFRESH_TOKEN_EXPIRE_DAYS", 30)
+TELEGRAM_LOGIN_BOT_TOKEN = os.getenv("TELEGRAM_LOGIN_BOT_TOKEN", "").strip()
+TELEGRAM_LOGIN_MAX_AGE_SECONDS = _env_int("TELEGRAM_LOGIN_MAX_AGE_SECONDS", 86400)
 ICAN_CREDIT_API_URL = os.getenv("ICAN_CREDIT_API_URL", "https://api.credit.icangroup.uz").rstrip("/")
 ICAN_CREDIT_CREATE_PATH = os.getenv("ICAN_CREDIT_CREATE_PATH", "/external/ican/credit/create")
 ICAN_CREDIT_USERNAME = os.getenv("ICAN_CREDIT_USERNAME", "")
