@@ -28,6 +28,8 @@ class Product(Base):
     credit_plans = Column(Text, nullable=True)
     config_options = Column(Text, nullable=True)
     images = Column(String, nullable=True)
+    # Display order for frontend listing (smaller = first; same order → by id).
+    order = Column("order", Integer, nullable=False, default=999999)
 
 
 class HeroSlide(Base):

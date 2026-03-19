@@ -46,6 +46,7 @@ SUMMARY_PRODUCT_COLUMNS = (
     models.Product.credit_plans,
     models.Product.config_options,
     models.Product.images,
+    models.Product.order,
 )
 
 
@@ -729,6 +730,7 @@ def serialize_product(product: models.Product, include_full_details: bool = True
     credit_months, credit_percent = resolve_credit_fields(product)
     payload: dict[str, Any] = {
         "id": product.id,
+        "order": getattr(product, "order", 999999),
         "name_uz": product.name_uz,
         "name_ru": product.name_ru,
         "name_en": product.name_en,
@@ -767,7 +769,7 @@ def get_products(
     offset: int = Query(0, ge=0),
     include_full_details: bool = Query(False),
 ):
-    query = db.query(models.Product).order_by(models.Product.id.desc())
+    query = db.query(models.Product).order_by(models.Product.order.asc(), models.Product.id.asc())
     if not include_full_details:
         query = query.options(load_only(*SUMMARY_PRODUCT_COLUMNS))
 
@@ -796,7 +798,7 @@ def filter_products(
     products = (
         db.query(models.Product)
         .options(load_only(*SUMMARY_PRODUCT_COLUMNS))
-        .order_by(models.Product.id.desc())
+        .order_by(models.Product.order.asc(), models.Product.id.asc())
         .all()
     )
 
@@ -838,12 +840,14 @@ async def create_product(
     credit_percent: str = Form(""),
     credit_6m_percent: str = Form(""),
     config_options: str = Form(""),
+    order: str = Form("999999"),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
 ):
     image_urls = [save_file(file) for file in files] if files else []
     is_credit_enabled = parse_bool_flag(credit_enabled)
+    order_value = int(order) if str(order).strip().isdigit() else 999999
     parsed_credit_plans = normalize_credit_plans(credit_plans)
 
     if not parsed_credit_plans:
@@ -891,6 +895,7 @@ async def create_product(
         credit_plans=dump_credit_plans(parsed_credit_plans) if is_credit_enabled else None,
         config_options=dump_config_options(config_options),
         images=",".join(image_urls) if image_urls else None,
+        order=order_value,
     )
 
     db.add(new_product)
@@ -922,6 +927,7 @@ async def update_product(
     credit_percent: str = Form(""),
     credit_6m_percent: str = Form(""),
     config_options: str = Form(""),
+    order: str = Form("999999"),
     oldImages: List[str] = Form([]),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -981,6 +987,8 @@ async def update_product(
     )
     product.credit_plans = dump_credit_plans(parsed_credit_plans) if product.credit_enabled else None
     product.config_options = dump_config_options(config_options)
+    order_value = int(order) if str(order).strip().isdigit() else 999999
+    product.order = order_value
 
     keep_images = oldImages if oldImages else []
     new_files = [save_file(file) for file in files] if files else []
