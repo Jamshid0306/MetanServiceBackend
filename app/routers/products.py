@@ -47,6 +47,7 @@ SUMMARY_PRODUCT_COLUMNS = (
     models.Product.config_options,
     models.Product.images,
     models.Product.order,
+    models.Product.is_active,
 )
 
 
@@ -745,6 +746,7 @@ def serialize_product(product: models.Product, include_full_details: bool = True
         "credit_plans": credit_plans,
         "config_options": normalize_config_options(product.config_options),
         "images": product.images.split(",") if product.images else [],
+        "is_active": bool(getattr(product, "is_active", 1)),
     }
 
     if include_full_details:
@@ -768,8 +770,16 @@ def get_products(
     limit: int = Query(20, ge=1),
     offset: int = Query(0, ge=0),
     include_full_details: bool = Query(False),
+    include_inactive: bool = Query(
+        False,
+        description="If true, return inactive products too (admin). Public catalog uses false.",
+    ),
 ):
-    query = db.query(models.Product).order_by(models.Product.order.asc(), models.Product.id.asc())
+    base = db.query(models.Product)
+    if not include_inactive:
+        base = base.filter(models.Product.is_active == 1)
+    total = base.count()
+    query = base.order_by(models.Product.order.asc(), models.Product.id.asc())
     if not include_full_details:
         query = query.options(load_only(*SUMMARY_PRODUCT_COLUMNS))
 
@@ -778,8 +788,6 @@ def get_products(
     result = []
     for p in products:
         result.append(serialize_product(p, include_full_details=include_full_details))
-
-    total = db.query(models.Product).count()
 
     return {
         "total": total,
@@ -797,6 +805,7 @@ def filter_products(
 ):
     products = (
         db.query(models.Product)
+        .filter(models.Product.is_active == 1)
         .options(load_only(*SUMMARY_PRODUCT_COLUMNS))
         .order_by(models.Product.order.asc(), models.Product.id.asc())
         .all()
@@ -841,6 +850,7 @@ async def create_product(
     credit_6m_percent: str = Form(""),
     config_options: str = Form(""),
     order: str = Form("999999"),
+    is_active: str = Form("true"),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
@@ -848,6 +858,7 @@ async def create_product(
     image_urls = [save_file(file) for file in files] if files else []
     is_credit_enabled = parse_bool_flag(credit_enabled)
     order_value = int(order) if str(order).strip().isdigit() else 999999
+    is_active_value = 1 if parse_bool_flag(is_active) else 0
     parsed_credit_plans = normalize_credit_plans(credit_plans)
 
     if not parsed_credit_plans:
@@ -896,6 +907,7 @@ async def create_product(
         config_options=dump_config_options(config_options),
         images=",".join(image_urls) if image_urls else None,
         order=order_value,
+        is_active=is_active_value,
     )
 
     db.add(new_product)
@@ -928,6 +940,7 @@ async def update_product(
     credit_6m_percent: str = Form(""),
     config_options: str = Form(""),
     order: str = Form("999999"),
+    is_active: str = Form("true"),
     oldImages: List[str] = Form([]),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -989,6 +1002,7 @@ async def update_product(
     product.config_options = dump_config_options(config_options)
     order_value = int(order) if str(order).strip().isdigit() else 999999
     product.order = order_value
+    product.is_active = 1 if parse_bool_flag(is_active) else 0
 
     keep_images = oldImages if oldImages else []
     new_files = [save_file(file) for file in files] if files else []
@@ -1012,8 +1026,32 @@ def get_product_detail(
     product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
+    if not getattr(product, "is_active", 1):
+        raise HTTPException(status_code=404, detail="Product not found")
 
     return serialize_product(product)
+
+
+class ProductActivePayload(BaseModel):
+    is_active: bool
+
+
+@router.patch("/active/{product_id}")
+def patch_product_active(
+    product_id: int,
+    payload: ProductActivePayload,
+    db: Session = Depends(get_db),
+    token: dict = Depends(verify_token),
+):
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product.is_active = 1 if payload.is_active else 0
+    db.commit()
+    db.refresh(product)
+
+    return {"success": True, "product_id": product.id, "is_active": bool(product.is_active)}
 
 
 @router.post("/order")

@@ -30,6 +30,8 @@ class Product(Base):
     images = Column(String, nullable=True)
     # Display order for frontend listing (smaller = first; same order → by id).
     order = Column("order", Integer, nullable=False, default=999999)
+    # 1 = shown on public site, 0 = hidden from catalog (admin still sees all).
+    is_active = Column(Integer, nullable=False, default=1)
 
 
 class HeroSlide(Base):

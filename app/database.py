@@ -112,6 +112,9 @@ def _migrate_to_products_only_schema() -> None:
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "order"):
             cursor.execute("ALTER TABLE products ADD COLUMN \"order\" INTEGER NOT NULL DEFAULT 999999")
 
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "is_active"):
+            cursor.execute("ALTER TABLE products ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+
         if _table_exists(cursor, "products"):
             cursor.execute(
                 """
