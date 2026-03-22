@@ -26,10 +26,9 @@ from ..database import get_db
 from ..orders_database import save_order
 
 router = APIRouter()
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 DEFAULT_FUEL_TYPE_LABEL = "Standart"
 DEFAULT_TRANSMISSION_LABEL = "Standart"
-DEFAULT_GENERATION_LABEL = "Standart"
 SUMMARY_PRODUCT_COLUMNS = (
     models.Product.id,
     models.Product.name_uz,
@@ -475,11 +474,51 @@ def _normalize_cylinder_volume_list(
     return normalized
 
 
-def _normalize_generation_item(
+def _dedupe_cylinder_volumes_by_id(volumes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for v in volumes:
+        oid = str(v.get("id") or "").strip()
+        if not oid or oid in seen:
+            continue
+        seen.add(oid)
+        out.append(v)
+    return out
+
+
+def _collect_cylinder_volumes_from_transmission_raw(
+    item: dict[str, Any],
+    option_id: str,
+    fallback_volumes: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Yangi: balonlar transmission ostida. Eski JSON: avlodlar ichidagi balonlar — birlashtiriladi."""
+    direct = item.get("cylinder_volumes")
+    if isinstance(direct, list) and direct:
+        normalized = _normalize_cylinder_volume_list(direct, f"{option_id}-volume")
+        if normalized:
+            return normalized
+    gens = item.get("generations")
+    if isinstance(gens, list) and gens:
+        merged: list[dict[str, Any]] = []
+        for idx, gen in enumerate(gens):
+            if isinstance(gen, dict):
+                vols = gen.get("cylinder_volumes")
+                if isinstance(vols, list):
+                    merged.extend(
+                        _normalize_cylinder_volume_list(vols, f"{option_id}-g{idx}-volume")
+                    )
+        if merged:
+            return _dedupe_cylinder_volumes_by_id(merged)
+    if fallback_volumes:
+        return [dict(v) for v in fallback_volumes]
+    return []
+
+
+def _normalize_transmission_item(
     item: Any,
     index: int,
     prefix: str,
-    fallback_volumes: Optional[list[dict[str, Any]]] = None,
+    fallback_cylinder_volumes: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(item, dict):
         return None
@@ -489,11 +528,8 @@ def _normalize_generation_item(
         return None
 
     option_id = str(item.get("id") or f"{prefix}-{index + 1}").strip()
-    raw_volumes = item.get("cylinder_volumes")
-    cylinder_volumes = (
-        _normalize_cylinder_volume_list(raw_volumes, f"{option_id}-volume")
-        if isinstance(raw_volumes, list)
-        else [dict(volume) for volume in (fallback_volumes or [])]
+    cylinder_volumes = _collect_cylinder_volumes_from_transmission_raw(
+        item, option_id, fallback_cylinder_volumes
     )
     price_delta = parse_numeric_price(item.get("price_delta"))
 
@@ -506,65 +542,17 @@ def _normalize_generation_item(
     }
 
 
-def _normalize_generation_list(
-    values: Any,
-    prefix: str,
-    fallback_volumes: Optional[list[dict[str, Any]]] = None,
-) -> list[dict[str, Any]]:
-    if not isinstance(values, list):
-        return []
-
-    normalized: list[dict[str, Any]] = []
-    for index, item in enumerate(values):
-        option = _normalize_generation_item(item, index, prefix, fallback_volumes)
-        if option:
-            normalized.append(option)
-
-    return normalized
-
-
-def _normalize_transmission_item(
-    item: Any,
-    index: int,
-    prefix: str,
-    fallback_generations: Optional[list[dict[str, Any]]] = None,
-) -> Optional[dict[str, Any]]:
-    if not isinstance(item, dict):
-        return None
-
-    label = str(item.get("label", "")).strip()
-    if not label:
-        return None
-
-    option_id = str(item.get("id") or f"{prefix}-{index + 1}").strip()
-    raw_generations = item.get("generations")
-    generations = (
-        _normalize_generation_list(raw_generations, f"{option_id}-generation")
-        if isinstance(raw_generations, list)
-        else [dict(generation) for generation in (fallback_generations or [])]
-    )
-    price_delta = parse_numeric_price(item.get("price_delta"))
-
-    return {
-        "id": option_id,
-        "label": label,
-        "hidden": bool(item.get("hidden")),
-        "price_delta": int(price_delta or 0),
-        "generations": generations,
-    }
-
-
 def _normalize_transmission_list(
     values: Any,
     prefix: str,
-    fallback_generations: Optional[list[dict[str, Any]]] = None,
+    fallback_cylinder_volumes: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(values, list):
         return []
 
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(values):
-        option = _normalize_transmission_item(item, index, prefix, fallback_generations)
+        option = _normalize_transmission_item(item, index, prefix, fallback_cylinder_volumes)
         if option:
             normalized.append(option)
 
@@ -617,23 +605,13 @@ def _normalize_fuel_type_list(
     return normalized
 
 
-def _create_synthetic_generation(volumes: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "id": "generation-default",
-        "label": DEFAULT_GENERATION_LABEL,
-        "hidden": True,
-        "price_delta": 0,
-        "cylinder_volumes": [dict(volume) for volume in volumes],
-    }
-
-
-def _create_synthetic_transmission(generations: list[dict[str, Any]]) -> dict[str, Any]:
+def _create_synthetic_transmission(cylinder_volumes: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "id": "transmission-default",
         "label": DEFAULT_TRANSMISSION_LABEL,
         "hidden": True,
         "price_delta": 0,
-        "generations": [dict(generation) for generation in generations],
+        "cylinder_volumes": [dict(volume) for volume in cylinder_volumes],
     }
 
 
@@ -648,27 +626,17 @@ def _create_synthetic_fuel_type(transmissions: list[dict[str, Any]]) -> dict[str
 
 def _normalize_legacy_config(source: dict[str, Any]) -> list[dict[str, Any]]:
     legacy_volumes = _normalize_cylinder_volume_list(source.get("cylinder_volume"), "legacy-volume")
-    legacy_generations = _normalize_generation_list(
-        source.get("cylinder_position"),
-        "legacy-generation",
-        legacy_volumes,
-    )
-    fallback_generations = (
-        legacy_generations
-        if legacy_generations
-        else [_create_synthetic_generation(legacy_volumes)] if legacy_volumes else []
-    )
     legacy_transmissions = _normalize_transmission_list(
         source.get("transmission"),
         "legacy-transmission",
-        fallback_generations,
+        legacy_volumes,
     )
 
     if legacy_transmissions:
         return [_create_synthetic_fuel_type(legacy_transmissions)]
 
-    if fallback_generations:
-        return [_create_synthetic_fuel_type([_create_synthetic_transmission(fallback_generations)])]
+    if legacy_volumes:
+        return [_create_synthetic_fuel_type([_create_synthetic_transmission(legacy_volumes)])]
 
     direct_transmissions = _normalize_transmission_list(source.get("transmissions"), "transmission")
     if direct_transmissions:
