@@ -26,7 +26,7 @@ from ..database import get_db
 from ..orders_database import save_order
 
 router = APIRouter()
-CONFIG_SCHEMA_VERSION = 5
+CONFIG_SCHEMA_VERSION = 6
 DEFAULT_FUEL_TYPE_LABEL = "Standart"
 DEFAULT_TRANSMISSION_LABEL = "Standart"
 SUMMARY_PRODUCT_COLUMNS = (
@@ -559,6 +559,84 @@ def _normalize_transmission_list(
     return normalized
 
 
+def _infer_gearbox_from_transmissions(
+    transmissions: list[dict[str, Any]],
+) -> tuple[bool, int, int]:
+    auto: Optional[dict[str, Any]] = None
+    manual: Optional[dict[str, Any]] = None
+    for tr in transmissions:
+        lab = str(tr.get("label", "")).lower()
+        if any(
+            x in lab
+            for x in ("avtomat", "автомат", "automatic", "auto")
+        ):
+            auto = tr
+        if any(
+            x in lab
+            for x in ("mexanika", "mehanika", "manual", "механика", "mechanic")
+        ):
+            manual = tr
+    if auto and manual:
+        return (
+            True,
+            int(auto.get("price_delta", 0) or 0),
+            int(manual.get("price_delta", 0) or 0),
+        )
+    return False, 0, 0
+
+
+def _build_transmissions_from_fuel_shape(
+    option_id: str,
+    volumes: list[dict[str, Any]],
+    gearbox_enabled: bool,
+    auto_delta: int,
+    manual_delta: int,
+) -> list[dict[str, Any]]:
+    def dup_volumes() -> list[dict[str, Any]]:
+        return [dict(v) for v in volumes]
+
+    if gearbox_enabled:
+        out = [
+            _normalize_transmission_item(
+                {
+                    "id": f"{option_id}-gearbox-auto",
+                    "label": "Avtomat",
+                    "hidden": False,
+                    "price_delta": auto_delta,
+                    "cylinder_volumes": dup_volumes(),
+                },
+                0,
+                f"{option_id}-trans",
+            ),
+            _normalize_transmission_item(
+                {
+                    "id": f"{option_id}-gearbox-manual",
+                    "label": "Mexanika",
+                    "hidden": False,
+                    "price_delta": manual_delta,
+                    "cylinder_volumes": dup_volumes(),
+                },
+                1,
+                f"{option_id}-trans",
+            ),
+        ]
+    else:
+        out = [
+            _normalize_transmission_item(
+                {
+                    "id": f"{option_id}-gearbox-off",
+                    "label": DEFAULT_TRANSMISSION_LABEL,
+                    "hidden": False,
+                    "price_delta": 0,
+                    "cylinder_volumes": dup_volumes(),
+                },
+                0,
+                f"{option_id}-trans",
+            ),
+        ]
+    return [t for t in out if t]
+
+
 def _normalize_fuel_type_item(
     item: Any,
     index: int,
@@ -573,17 +651,65 @@ def _normalize_fuel_type_item(
         return None
 
     option_id = str(item.get("id") or f"{prefix}-{index + 1}").strip()
-    raw_transmissions = item.get("transmissions")
-    transmissions = (
-        _normalize_transmission_list(raw_transmissions, f"{option_id}-transmission")
-        if isinstance(raw_transmissions, list)
-        else [dict(transmission) for transmission in (fallback_transmissions or [])]
+
+    fuel_level_volumes = item.get("cylinder_volumes")
+    has_fuel_volumes = isinstance(fuel_level_volumes, list) and len(fuel_level_volumes) > 0
+
+    volumes_normalized: list[dict[str, Any]] = []
+    gearbox_enabled = False
+    automatic_price_delta = 0
+    manual_price_delta = 0
+
+    if has_fuel_volumes:
+        volumes_normalized = _normalize_cylinder_volume_list(
+            fuel_level_volumes,
+            f"{option_id}-volume",
+        )
+        gearbox_enabled = bool(item.get("gearbox_program_enabled"))
+        automatic_price_delta = int(parse_numeric_price(item.get("automatic_price_delta")) or 0)
+        manual_price_delta = int(parse_numeric_price(item.get("manual_price_delta")) or 0)
+    elif isinstance(item.get("transmissions"), list) and item["transmissions"]:
+        raw_trs = item["transmissions"]
+        merged_raw: list[dict[str, Any]] = []
+        for tr in raw_trs:
+            if isinstance(tr, dict):
+                merged_raw.extend(
+                    _collect_cylinder_volumes_from_transmission_raw(tr, [])
+                )
+        volumes_normalized = _normalize_cylinder_volume_list(
+            merged_raw,
+            f"{option_id}-volume",
+        )
+        normalized_trs = _normalize_transmission_list(raw_trs, f"{option_id}-legacy-trans")
+        gb, automatic_price_delta, manual_price_delta = _infer_gearbox_from_transmissions(
+            normalized_trs
+        )
+        gearbox_enabled = gb
+    elif fallback_transmissions:
+        return _normalize_fuel_type_item(
+            {**item, "transmissions": fallback_transmissions},
+            index,
+            prefix,
+            None,
+        )
+    else:
+        volumes_normalized = []
+
+    transmissions = _build_transmissions_from_fuel_shape(
+        option_id,
+        volumes_normalized,
+        gearbox_enabled,
+        automatic_price_delta,
+        manual_price_delta,
     )
 
     return {
         "id": option_id,
         "label": label,
         "hidden": bool(item.get("hidden")),
+        "gearbox_program_enabled": gearbox_enabled,
+        "automatic_price_delta": automatic_price_delta,
+        "manual_price_delta": manual_price_delta,
         "transmissions": transmissions,
     }
 
@@ -609,7 +735,7 @@ def _create_synthetic_transmission(cylinder_volumes: list[dict[str, Any]]) -> di
     return {
         "id": "transmission-default",
         "label": DEFAULT_TRANSMISSION_LABEL,
-        "hidden": True,
+        "hidden": False,
         "price_delta": 0,
         "cylinder_volumes": [dict(volume) for volume in cylinder_volumes],
     }
@@ -663,7 +789,31 @@ def dump_config_options(raw_options: Optional[Any]) -> Optional[str]:
     normalized = normalize_config_options(raw_options)
     if not normalized["fuel_types"]:
         return None
-    return json.dumps(normalized, ensure_ascii=False)
+    fuel_types_out: list[dict[str, Any]] = []
+    for ft in normalized["fuel_types"]:
+        tr0 = (ft.get("transmissions") or [{}])[0]
+        cyl = tr0.get("cylinder_volumes") or []
+        fuel_types_out.append(
+            {
+                "id": ft["id"],
+                "label": ft["label"],
+                "hidden": False,
+                "cylinder_volumes": [
+                    {
+                        "id": v["id"],
+                        "label": v["label"],
+                        "count": v.get("count", 1),
+                        "price_delta": v.get("price_delta", 0),
+                    }
+                    for v in cyl
+                ],
+                "gearbox_program_enabled": bool(ft.get("gearbox_program_enabled")),
+                "automatic_price_delta": int(ft.get("automatic_price_delta", 0)),
+                "manual_price_delta": int(ft.get("manual_price_delta", 0)),
+            }
+        )
+    payload = {"schema_version": CONFIG_SCHEMA_VERSION, "fuel_types": fuel_types_out}
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class CreditOrderPayload(BaseModel):
