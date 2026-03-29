@@ -12,6 +12,7 @@ from ..customers_database import (
     get_customer_record_by_telegram_username,
     normalize_telegram_username,
     save_customer_account,
+    update_customer_password_by_phone,
 )
 from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_MAX_AGE_SECONDS
 
@@ -105,6 +106,12 @@ class TelegramLoginPayload(BaseModel):
     last_name: str | None = None
     username: str | None = None
     photo_url: str | None = None
+
+
+class CustomerResetPasswordPayload(BaseModel):
+    phone: str
+    password: str
+    reset_token: str | None = None
 
 
 def verify_telegram_login(payload: TelegramLoginPayload) -> dict[str, Any]:
@@ -241,6 +248,30 @@ def register_customer(payload: CustomerRegisterPayload):
                 detail="This Telegram username is already registered",
             ) from error
         raise
+
+    return {
+        "success": True,
+        "customer": customer,
+    }
+
+
+@router.post("/reset-password")
+def reset_customer_password(payload: CustomerResetPasswordPayload):
+    normalized_phone = normalize_phone_number(payload.phone)
+    password = validate_password(payload.password)
+
+    if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid Uzbekistan phone number",
+        )
+
+    customer = update_customer_password_by_phone(normalized_phone, password)
+    if not customer:
+        raise HTTPException(
+            status_code=404,
+            detail="Customer profile was not found for this phone number",
+        )
 
     return {
         "success": True,

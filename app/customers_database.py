@@ -228,5 +228,36 @@ def authenticate_customer(identifier: str, password: str):
     return serialize_customer(record)
 
 
+def update_customer_password_by_phone(phone: str, password: str):
+    normalized_phone = str(phone or "").strip()
+    existing_record = get_customer_record_by_phone(normalized_phone)
+    if not existing_record:
+      return None
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    password_hash = hash_password(password)
+    cursor.execute(
+        """
+        UPDATE customers
+        SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (password_hash, existing_record["id"]),
+    )
+    conn.commit()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_username, password_hash, created_at, updated_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (existing_record["id"],),
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return serialize_customer(record)
+
+
 init_customers_db()
 ensure_customer_columns()
