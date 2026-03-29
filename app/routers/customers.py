@@ -15,6 +15,7 @@ from ..customers_database import (
     update_customer_password_by_phone,
 )
 from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_MAX_AGE_SECONDS
+from ..config import TELEGRAM_LOGIN_BOT_USERNAME
 
 router = APIRouter()
 
@@ -122,30 +123,60 @@ def verify_telegram_login(payload: TelegramLoginPayload) -> dict[str, Any]:
         )
 
     payload_data = payload.model_dump(exclude_none=True)
-    received_hash = str(payload_data.pop("hash", "")).strip()
-
-    if not received_hash:
-        raise HTTPException(status_code=400, detail="Telegram hash is required")
-
-    data_check_string = "\n".join(
-        f"{key}={payload_data[key]}"
-        for key in sorted(payload_data.keys())
-    )
-    secret_key = hashlib.sha256(TELEGRAM_LOGIN_BOT_TOKEN.encode("utf-8")).digest()
-    calculated_hash = hmac.new(
-        secret_key,
-        data_check_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(calculated_hash, received_hash):
+    if not verify_telegram_widget_auth(
+        payload_data,
+        TELEGRAM_LOGIN_BOT_TOKEN,
+        TELEGRAM_LOGIN_MAX_AGE_SECONDS,
+    ):
         raise HTTPException(status_code=401, detail="Telegram login verification failed")
-
-    auth_age = int(time.time()) - int(payload.auth_date)
-    if auth_age > TELEGRAM_LOGIN_MAX_AGE_SECONDS:
-        raise HTTPException(status_code=401, detail="Telegram login request expired")
+    payload_data.pop("hash", None)
 
     return payload_data
+
+
+def verify_telegram_widget_auth(
+    auth: dict[str, Any],
+    bot_token: str,
+    max_age_seconds: int = 86400,
+) -> bool:
+    if not bot_token or not auth:
+        return False
+
+    check_hash = auth.get("hash")
+    if not check_hash:
+        return False
+
+    try:
+        auth_date = int(auth.get("auth_date", 0))
+    except (TypeError, ValueError):
+        return False
+
+    if int(time.time()) - auth_date > max_age_seconds:
+        return False
+
+    payload = {
+        key: value
+        for key, value in auth.items()
+        if key != "hash" and value is not None and value != ""
+    }
+    data_check_string = "\n".join(
+        f"{key}={value}" for key, value in sorted(payload.items(), key=lambda item: item[0])
+    )
+    secret_key = hashlib.sha256(bot_token.encode("utf-8")).digest()
+    digest = hmac.new(
+        secret_key,
+        msg=data_check_string.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(digest, str(check_hash))
+
+
+@router.get("/telegram/config")
+def telegram_customer_login_config():
+    return {
+        "enabled": bool(TELEGRAM_LOGIN_BOT_TOKEN and TELEGRAM_LOGIN_BOT_USERNAME),
+        "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
+    }
 
 
 @router.post("/login")
