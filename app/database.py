@@ -188,6 +188,48 @@ def _migrate_to_products_only_schema() -> None:
         conn.close()
 
 
+def _ensure_extra_services_schema() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+
+        if not _table_exists(cursor, "extra_services"):
+            cursor.execute(
+                """
+                CREATE TABLE extra_services (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    name_uz VARCHAR NOT NULL,
+                    name_ru VARCHAR NOT NULL,
+                    name_en VARCHAR NOT NULL,
+                    characteristic_uz TEXT,
+                    characteristic_ru TEXT,
+                    characteristic_en TEXT,
+                    price_uz VARCHAR NOT NULL,
+                    price_ru VARCHAR NOT NULL,
+                    price_en VARCHAR NOT NULL
+                )
+                """
+            )
+
+        if not _table_exists(cursor, "product_extra_services"):
+            cursor.execute(
+                """
+                CREATE TABLE product_extra_services (
+                    product_id INTEGER NOT NULL,
+                    service_id INTEGER NOT NULL,
+                    PRIMARY KEY (product_id, service_id),
+                    FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE,
+                    FOREIGN KEY (service_id) REFERENCES extra_services (id) ON DELETE CASCADE
+                )
+                """
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -198,6 +240,7 @@ def get_db():
 
 def init_db():
     _migrate_to_products_only_schema()
+    _ensure_extra_services_schema()
     from . import models  # bu import barcha modellarni yuklaydi
 
     Base.metadata.create_all(bind=engine)

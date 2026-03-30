@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 
 from .database import Base
 
@@ -42,3 +42,25 @@ class HeroSlide(Base):
     duration_days = Column(Integer, nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
+
+
+class ExtraService(Base):
+    __tablename__ = "extra_services"
+
+    id = Column(Integer, primary_key=True)
+    name_uz = Column(String, nullable=False)
+    name_ru = Column(String, nullable=False)
+    name_en = Column(String, nullable=False)
+    characteristic_uz = Column(Text)
+    characteristic_ru = Column(Text)
+    characteristic_en = Column(Text)
+    price_uz = Column(String, nullable=False)
+    price_ru = Column(String, nullable=False)
+    price_en = Column(String, nullable=False)
+
+
+class ProductExtraService(Base):
+    __tablename__ = "product_extra_services"
+
+    product_id = Column(Integer, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True)
+    service_id = Column(Integer, ForeignKey("extra_services.id", ondelete="CASCADE"), primary_key=True)

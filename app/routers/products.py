@@ -341,6 +341,180 @@ def normalize_credit_plans(raw_plans: Optional[Any]) -> list[dict[str, int]]:
     return normalized
 
 
+def normalize_product_id_list(raw_ids: Any) -> list[int]:
+    source = raw_ids
+
+    if isinstance(source, str):
+        if not source.strip():
+            source = []
+        else:
+            try:
+                source = json.loads(source)
+            except json.JSONDecodeError:
+                source = []
+
+    if not isinstance(source, list):
+        return []
+
+    normalized: list[int] = []
+    seen: set[int] = set()
+
+    for item in source:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+
+        if value <= 0 or value in seen:
+            continue
+
+        normalized.append(value)
+        seen.add(value)
+
+    return normalized
+
+
+def serialize_service(
+    service: models.ExtraService,
+    attached_product_ids: Optional[list[int]] = None,
+) -> dict[str, Any]:
+    return {
+        "id": service.id,
+        "name_uz": service.name_uz,
+        "name_ru": service.name_ru,
+        "name_en": service.name_en,
+        "characteristic_uz": service.characteristic_uz,
+        "characteristic_ru": service.characteristic_ru,
+        "characteristic_en": service.characteristic_en,
+        "price_uz": service.price_uz,
+        "price_ru": service.price_ru,
+        "price_en": service.price_en,
+        "product_ids": attached_product_ids or [],
+    }
+
+
+def load_service_product_ids_map(
+    db: Session,
+    *,
+    service_ids: Optional[list[int]] = None,
+    product_ids: Optional[list[int]] = None,
+) -> dict[int, list[int]]:
+    query = db.query(models.ProductExtraService)
+
+    if service_ids:
+        query = query.filter(models.ProductExtraService.service_id.in_(service_ids))
+
+    if product_ids:
+        query = query.filter(models.ProductExtraService.product_id.in_(product_ids))
+
+    rows = query.all()
+    result: dict[int, list[int]] = {}
+
+    for row in rows:
+        key = int(row.service_id)
+        result.setdefault(key, []).append(int(row.product_id))
+
+    for value in result.values():
+        value.sort()
+
+    return result
+
+
+def load_product_service_ids_map(
+    db: Session,
+    *,
+    product_ids: list[int],
+) -> dict[int, list[int]]:
+    rows = (
+        db.query(models.ProductExtraService)
+        .filter(models.ProductExtraService.product_id.in_(product_ids))
+        .all()
+    )
+    result: dict[int, list[int]] = {}
+
+    for row in rows:
+        key = int(row.product_id)
+        result.setdefault(key, []).append(int(row.service_id))
+
+    for value in result.values():
+        value.sort()
+
+    return result
+
+
+def load_services_by_ids(
+    db: Session,
+    service_ids: list[int],
+) -> dict[int, models.ExtraService]:
+    if not service_ids:
+        return {}
+
+    services = (
+        db.query(models.ExtraService)
+        .filter(models.ExtraService.id.in_(service_ids))
+        .all()
+    )
+    return {service.id: service for service in services}
+
+
+def attach_extra_services_to_products(
+    db: Session,
+    products_payload: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    product_ids = [int(product["id"]) for product in products_payload if product.get("id")]
+    if not product_ids:
+        return products_payload
+
+    product_service_map = load_product_service_ids_map(db, product_ids=product_ids)
+    service_ids = sorted(
+        {
+            service_id
+            for service_list in product_service_map.values()
+            for service_id in service_list
+        }
+    )
+    services_by_id = load_services_by_ids(db, service_ids)
+
+    for product in products_payload:
+        linked_service_ids = product_service_map.get(int(product["id"]), [])
+        product["extra_services"] = [
+            serialize_service(services_by_id[service_id], attached_product_ids=[int(product["id"])])
+            for service_id in linked_service_ids
+            if service_id in services_by_id
+        ]
+
+    return products_payload
+
+
+def sync_service_product_links(
+    db: Session,
+    *,
+    service_id: int,
+    product_ids: list[int],
+) -> None:
+    db.query(models.ProductExtraService).filter(
+        models.ProductExtraService.service_id == service_id
+    ).delete(synchronize_session=False)
+
+    if not product_ids:
+        return
+
+    existing_product_ids = {
+        product.id
+        for product in db.query(models.Product.id)
+        .filter(models.Product.id.in_(product_ids))
+        .all()
+    }
+
+    for product_id in sorted(existing_product_ids):
+        db.add(
+            models.ProductExtraService(
+                product_id=product_id,
+                service_id=service_id,
+            )
+        )
+
+
 def dump_credit_plans(raw_plans: Optional[Any]) -> Optional[str]:
     normalized = normalize_credit_plans(raw_plans)
     if not normalized:
@@ -876,6 +1050,7 @@ def serialize_product(product: models.Product, include_full_details: bool = True
                 "characteristic_uz": product.characteristic_uz,
                 "characteristic_ru": product.characteristic_ru,
                 "characteristic_en": product.characteristic_en,
+                "extra_services": [],
             }
         )
 
@@ -906,6 +1081,9 @@ def get_products(
     result = []
     for p in products:
         result.append(serialize_product(p, include_full_details=include_full_details))
+
+    if include_full_details:
+        attach_extra_services_to_products(db, result)
 
     return {
         "total": total,
@@ -944,6 +1122,126 @@ def filter_products(
         )
 
     return {"products": result}
+
+
+class ExtraServicePayload(BaseModel):
+    name_uz: str
+    name_ru: str
+    name_en: str
+    characteristic_uz: str = ""
+    characteristic_ru: str = ""
+    characteristic_en: str = ""
+    price_uz: str
+    price_ru: str
+    price_en: str
+    product_ids: list[int] = Field(default_factory=list)
+
+
+@router.get("/services")
+def get_extra_services(
+    db: Session = Depends(get_db),
+    token: dict | None = Depends(verify_token),
+):
+    services = db.query(models.ExtraService).order_by(models.ExtraService.id.desc()).all()
+    service_ids = [service.id for service in services]
+    service_product_map = load_service_product_ids_map(db, service_ids=service_ids)
+
+    return {
+        "services": [
+            serialize_service(service, service_product_map.get(service.id, []))
+            for service in services
+        ]
+    }
+
+
+@router.post("/services")
+def create_extra_service(
+    payload: ExtraServicePayload,
+    db: Session = Depends(get_db),
+    token: dict = Depends(verify_token),
+):
+    service = models.ExtraService(
+        name_uz=payload.name_uz.strip(),
+        name_ru=payload.name_ru.strip(),
+        name_en=payload.name_en.strip(),
+        characteristic_uz=payload.characteristic_uz.strip(),
+        characteristic_ru=payload.characteristic_ru.strip(),
+        characteristic_en=payload.characteristic_en.strip(),
+        price_uz=payload.price_uz.strip(),
+        price_ru=payload.price_ru.strip(),
+        price_en=payload.price_en.strip(),
+    )
+
+    db.add(service)
+    db.flush()
+    sync_service_product_links(
+        db,
+        service_id=service.id,
+        product_ids=normalize_product_id_list(payload.product_ids),
+    )
+    db.commit()
+    db.refresh(service)
+
+    return {
+        "success": True,
+        "service": serialize_service(
+            service,
+            normalize_product_id_list(payload.product_ids),
+        ),
+    }
+
+
+@router.put("/services/{service_id}")
+def update_extra_service(
+    service_id: int,
+    payload: ExtraServicePayload,
+    db: Session = Depends(get_db),
+    token: dict = Depends(verify_token),
+):
+    service = db.query(models.ExtraService).filter(models.ExtraService.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    service.name_uz = payload.name_uz.strip()
+    service.name_ru = payload.name_ru.strip()
+    service.name_en = payload.name_en.strip()
+    service.characteristic_uz = payload.characteristic_uz.strip()
+    service.characteristic_ru = payload.characteristic_ru.strip()
+    service.characteristic_en = payload.characteristic_en.strip()
+    service.price_uz = payload.price_uz.strip()
+    service.price_ru = payload.price_ru.strip()
+    service.price_en = payload.price_en.strip()
+    normalized_product_ids = normalize_product_id_list(payload.product_ids)
+    sync_service_product_links(
+        db,
+        service_id=service.id,
+        product_ids=normalized_product_ids,
+    )
+    db.commit()
+    db.refresh(service)
+
+    return {
+        "success": True,
+        "service": serialize_service(service, normalized_product_ids),
+    }
+
+
+@router.delete("/services/{service_id}")
+def delete_extra_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    token: dict = Depends(verify_token),
+):
+    service = db.query(models.ExtraService).filter(models.ExtraService.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    db.query(models.ProductExtraService).filter(
+        models.ProductExtraService.service_id == service_id
+    ).delete(synchronize_session=False)
+    db.delete(service)
+    db.commit()
+    return {"success": True, "service_id": service_id}
 
 
 @router.post("/create")
@@ -1147,7 +1445,9 @@ def get_product_detail(
     if not getattr(product, "is_active", 1):
         raise HTTPException(status_code=404, detail="Product not found")
 
-    return serialize_product(product)
+    payload = serialize_product(product)
+    attach_extra_services_to_products(db, [payload])
+    return payload
 
 
 class ProductActivePayload(BaseModel):
@@ -1217,6 +1517,10 @@ async def delete_product(
     product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
+
+    db.query(models.ProductExtraService).filter(
+        models.ProductExtraService.product_id == product_id
+    ).delete(synchronize_session=False)
 
     if product.images:
         for img_path in product.images.split(","):
