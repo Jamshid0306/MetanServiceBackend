@@ -6,16 +6,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
 from ..customers_database import (
     authenticate_customer,
-    build_telegram_placeholder_phone,
-    get_customer_record_by_telegram_username,
+    get_customer_record_by_phone,
     normalize_telegram_username,
+    save_or_update_customer_from_telegram,
     save_customer_account,
     update_customer_password_by_phone,
 )
-from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_MAX_AGE_SECONDS
-from ..config import TELEGRAM_LOGIN_BOT_USERNAME
 
 router = APIRouter()
 
@@ -40,7 +39,7 @@ def validate_login_identifier(identifier: str) -> tuple[str, str]:
     if not raw_identifier:
         raise HTTPException(
             status_code=400,
-            detail="Telegram username or phone number is required",
+            detail="Phone number or username is required",
         )
 
     normalized_phone = normalize_phone_number(raw_identifier)
@@ -49,31 +48,12 @@ def validate_login_identifier(identifier: str) -> tuple[str, str]:
 
     normalized_username = normalize_telegram_username(raw_identifier)
     if len(normalized_username) >= 3:
-        return ("telegram", normalized_username)
+        return ("username", normalized_username)
 
     raise HTTPException(
         status_code=400,
-        detail="Enter a valid Telegram username or Uzbekistan phone number",
+        detail="Enter a valid username or Uzbekistan phone number",
     )
-
-
-def validate_telegram_username(username: str) -> str:
-    normalized_username = normalize_telegram_username(username)
-
-    if len(normalized_username) < 3:
-        raise HTTPException(
-            status_code=400,
-            detail="Telegram username must be at least 3 characters long",
-        )
-
-    allowed_characters = set("abcdefghijklmnopqrstuvwxyz0123456789_")
-    if any(character not in allowed_characters for character in normalized_username):
-        raise HTTPException(
-            status_code=400,
-            detail="Telegram username can contain only letters, numbers and underscores",
-        )
-
-    return normalized_username
 
 
 def validate_password(password: str) -> str:
@@ -95,18 +75,8 @@ class CustomerLoginPayload(BaseModel):
 
 class CustomerRegisterPayload(BaseModel):
     name: str
-    telegram_username: str
+    phone: str
     password: str
-
-
-class TelegramLoginPayload(BaseModel):
-    id: int
-    first_name: str
-    auth_date: int
-    hash: str
-    last_name: str | None = None
-    username: str | None = None
-    photo_url: str | None = None
 
 
 class CustomerResetPasswordPayload(BaseModel):
@@ -115,66 +85,72 @@ class CustomerResetPasswordPayload(BaseModel):
     reset_token: str | None = None
 
 
-def verify_telegram_login(payload: TelegramLoginPayload) -> dict[str, Any]:
-    if not TELEGRAM_LOGIN_BOT_TOKEN:
+class CustomerTelegramLoginPayload(BaseModel):
+    id: int | str
+    first_name: str | None = None
+    last_name: str | None = None
+    username: str | None = None
+    photo_url: str | None = None
+    auth_date: int | str
+    hash: str
+
+
+def build_telegram_data_check_string(payload: CustomerTelegramLoginPayload) -> str:
+    data = {
+        "auth_date": str(payload.auth_date),
+        "first_name": str(payload.first_name or "").strip(),
+        "id": str(payload.id),
+        "last_name": str(payload.last_name or "").strip(),
+        "photo_url": str(payload.photo_url or "").strip(),
+        "username": str(payload.username or "").strip(),
+    }
+    return "\n".join(
+        f"{key}={value}"
+        for key, value in sorted(data.items())
+        if value
+    )
+
+
+def validate_telegram_login(payload: CustomerTelegramLoginPayload) -> None:
+    if not TELEGRAM_LOGIN_BOT_USERNAME or not TELEGRAM_LOGIN_BOT_TOKEN:
         raise HTTPException(
             status_code=503,
-            detail="Telegram login is not configured on the server",
+            detail="Telegram login is not configured",
         )
 
-    payload_data = payload.model_dump(exclude_none=True)
-    if not verify_telegram_widget_auth(
-        payload_data,
-        TELEGRAM_LOGIN_BOT_TOKEN,
-        TELEGRAM_LOGIN_MAX_AGE_SECONDS,
-    ):
-        raise HTTPException(status_code=401, detail="Telegram login verification failed")
-    payload_data.pop("hash", None)
-
-    return payload_data
-
-
-def verify_telegram_widget_auth(
-    auth: dict[str, Any],
-    bot_token: str,
-    max_age_seconds: int = 86400,
-) -> bool:
-    if not bot_token or not auth:
-        return False
-
-    check_hash = auth.get("hash")
-    if not check_hash:
-        return False
-
     try:
-        auth_date = int(auth.get("auth_date", 0))
-    except (TypeError, ValueError):
-        return False
+        auth_date = int(str(payload.auth_date).strip())
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Telegram auth date is invalid",
+        ) from error
 
-    if int(time.time()) - auth_date > max_age_seconds:
-        return False
+    if auth_date < int(time.time()) - 86400:
+        raise HTTPException(
+            status_code=401,
+            detail="Telegram login data is expired",
+        )
 
-    payload = {
-        key: value
-        for key, value in auth.items()
-        if key != "hash" and value is not None and value != ""
-    }
-    data_check_string = "\n".join(
-        f"{key}={value}" for key, value in sorted(payload.items(), key=lambda item: item[0])
-    )
-    secret_key = hashlib.sha256(bot_token.encode("utf-8")).digest()
-    digest = hmac.new(
+    secret_key = hashlib.sha256(TELEGRAM_LOGIN_BOT_TOKEN.encode("utf-8")).digest()
+    data_check_string = build_telegram_data_check_string(payload)
+    expected_hash = hmac.new(
         secret_key,
-        msg=data_check_string.encode("utf-8"),
-        digestmod=hashlib.sha256,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
-    return hmac.compare_digest(digest, str(check_hash))
+
+    if not hmac.compare_digest(expected_hash, str(payload.hash or "").strip()):
+        raise HTTPException(
+            status_code=401,
+            detail="Telegram login verification failed",
+        )
 
 
-@router.get("/telegram/config")
-def telegram_customer_login_config():
+@router.get("/telegram-login/config")
+def get_telegram_login_config():
     return {
-        "enabled": bool(TELEGRAM_LOGIN_BOT_TOKEN and TELEGRAM_LOGIN_BOT_USERNAME),
+        "enabled": bool(TELEGRAM_LOGIN_BOT_USERNAME and TELEGRAM_LOGIN_BOT_TOKEN),
         "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
     }
 
@@ -188,7 +164,7 @@ def login_customer(payload: CustomerLoginPayload):
     if not customer:
         raise HTTPException(
             status_code=401,
-            detail="Telegram username, phone number or password is incorrect",
+            detail="Phone number, username or password is incorrect",
         )
 
     return {
@@ -197,48 +173,22 @@ def login_customer(payload: CustomerLoginPayload):
     }
 
 
-@router.post("/telegram")
-def telegram_customer_login(payload: TelegramLoginPayload):
-    verified_payload = verify_telegram_login(payload)
-    full_name = " ".join(
-        part.strip()
-        for part in [
-            str(verified_payload.get("first_name") or ""),
-            str(verified_payload.get("last_name") or ""),
-        ]
-        if part.strip()
-    ).strip()
-    telegram_username = normalize_telegram_username(verified_payload.get("username") or "")
-    customer_record = (
-        get_customer_record_by_telegram_username(telegram_username)
-        if telegram_username
-        else None
-    )
+@router.post("/telegram-login")
+def login_customer_with_telegram(payload: CustomerTelegramLoginPayload):
+    validate_telegram_login(payload)
 
-    if customer_record:
-        customer = {
-            "id": customer_record["id"],
-            "name": str(customer_record["name"] or full_name or "Telegram User"),
-            "phone": str(customer_record["phone"] or "") if str(customer_record["phone"] or "").isdigit() else "",
-            "telegram_id": verified_payload["id"],
-            "telegram_username": customer_record["telegram_username"],
-            "username": verified_payload.get("username"),
-            "photo_url": verified_payload.get("photo_url"),
-            "has_password": bool(str(customer_record["password_hash"] or "").strip()),
-            "created_at": customer_record["created_at"],
-            "updated_at": customer_record["updated_at"],
-        }
-    else:
-        customer = {
-            "id": f"telegram:{verified_payload['id']}",
-            "name": full_name or str(verified_payload.get("username") or "Telegram User"),
-            "phone": "",
-            "telegram_id": verified_payload["id"],
-            "telegram_username": telegram_username or None,
-            "username": verified_payload.get("username"),
-            "photo_url": verified_payload.get("photo_url"),
-            "has_password": False,
-        }
+    try:
+        customer = save_or_update_customer_from_telegram(
+            telegram_id=str(payload.id),
+            first_name=str(payload.first_name or "").strip(),
+            last_name=str(payload.last_name or "").strip(),
+            telegram_username=payload.username,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Telegram account could not be linked",
+        ) from error
 
     return {
         "success": True,
@@ -249,34 +199,40 @@ def telegram_customer_login(payload: TelegramLoginPayload):
 @router.post("/register")
 def register_customer(payload: CustomerRegisterPayload):
     name = payload.name.strip()
-    telegram_username = validate_telegram_username(payload.telegram_username)
+    normalized_phone = normalize_phone_number(payload.phone)
     password = validate_password(payload.password)
-    existing_customer = get_customer_record_by_telegram_username(telegram_username)
 
     if not name:
         raise HTTPException(
             status_code=400,
-            detail="Name, Telegram username and password are required",
+            detail="Name is required",
         )
 
+    if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid Uzbekistan phone number",
+        )
+
+    existing_customer = get_customer_record_by_phone(normalized_phone)
     if existing_customer and str(existing_customer["password_hash"] or "").strip():
         raise HTTPException(
             status_code=409,
-            detail="This Telegram username is already registered",
+            detail="This phone number is already registered",
         )
 
     try:
         customer = save_customer_account(
             name,
-            build_telegram_placeholder_phone(telegram_username),
+            normalized_phone,
             password,
-            telegram_username=telegram_username,
+            telegram_username=None,
         )
     except ValueError as error:
         if str(error) == "telegram_username_taken":
             raise HTTPException(
                 status_code=409,
-                detail="This Telegram username is already registered",
+                detail="This profile could not be created",
             ) from error
         raise
 

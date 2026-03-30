@@ -25,6 +25,7 @@ def init_customers_db():
             last_name TEXT,
             name TEXT,
             phone TEXT NOT NULL UNIQUE,
+            telegram_id TEXT UNIQUE,
             telegram_username TEXT UNIQUE,
             password_hash TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -50,6 +51,9 @@ def ensure_customer_columns():
 
     if "telegram_username" not in existing_columns:
         cursor.execute("ALTER TABLE customers ADD COLUMN telegram_username TEXT")
+
+    if "telegram_id" not in existing_columns:
+        cursor.execute("ALTER TABLE customers ADD COLUMN telegram_id TEXT")
 
     conn.commit()
     conn.close()
@@ -81,6 +85,7 @@ def serialize_customer(record):
         "id": record["id"],
         "name": build_customer_name(record),
         "phone": public_phone,
+        "telegram_id": record["telegram_id"],
         "telegram_username": record["telegram_username"],
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
@@ -124,7 +129,7 @@ def get_customer_record_by_phone(phone: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
         FROM customers
         WHERE phone = ?
         """,
@@ -154,11 +159,31 @@ def get_customer_record_by_telegram_username(telegram_username: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
         FROM customers
         WHERE lower(telegram_username) = ?
         """,
         (normalized_username,),
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return record
+
+
+def get_customer_record_by_telegram_id(telegram_id: str):
+    normalized_telegram_id = str(telegram_id or "").strip()
+    if not normalized_telegram_id:
+        return None
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        FROM customers
+        WHERE telegram_id = ?
+        """,
+        (normalized_telegram_id,),
     )
     record = cursor.fetchone()
     conn.close()
@@ -194,17 +219,17 @@ def save_customer_account(name: str, phone: str, password: str, telegram_usernam
     else:
         cursor.execute(
             """
-            INSERT INTO customers (first_name, last_name, name, phone, telegram_username, password_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO customers (first_name, last_name, name, phone, telegram_id, telegram_username, password_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, "", name, phone, normalized_username or None, password_hash),
+            (name, "", name, phone, None, normalized_username or None, password_hash),
         )
         customer_id = cursor.lastrowid
 
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -218,6 +243,9 @@ def save_customer_account(name: str, phone: str, password: str, telegram_usernam
 def authenticate_customer(identifier: str, password: str):
     normalized_identifier = str(identifier or "").strip()
     record = get_customer_record_by_phone(normalized_identifier)
+
+    if not record:
+        record = get_customer_record_by_telegram_id(normalized_identifier)
 
     if not record:
         record = get_customer_record_by_telegram_username(normalized_identifier)
@@ -248,11 +276,106 @@ def update_customer_password_by_phone(phone: str, password: str):
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
         (existing_record["id"],),
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return serialize_customer(record)
+
+
+def save_or_update_customer_from_telegram(
+    telegram_id: str,
+    first_name: str,
+    last_name: str,
+    telegram_username: str | None = None,
+):
+    normalized_telegram_id = str(telegram_id or "").strip()
+    normalized_username = normalize_telegram_username(telegram_username or "")
+    display_name = " ".join(
+        part.strip()
+        for part in [str(first_name or "").strip(), str(last_name or "").strip()]
+        if part.strip()
+    ).strip()
+
+    if not normalized_telegram_id:
+        raise ValueError("telegram_id_required")
+
+    if not display_name and normalized_username:
+        display_name = normalized_username
+
+    if not display_name:
+        display_name = f"Telegram {normalized_telegram_id}"
+
+    existing_record = get_customer_record_by_telegram_id(normalized_telegram_id)
+    existing_username_record = (
+        get_customer_record_by_telegram_username(normalized_username)
+        if normalized_username
+        else None
+    )
+
+    if (
+        existing_record
+        and existing_username_record
+        and existing_record["id"] != existing_username_record["id"]
+    ):
+        raise ValueError("telegram_identity_conflict")
+
+    matched_record = existing_record or existing_username_record
+    placeholder_phone = build_telegram_placeholder_phone(
+        normalized_username or normalized_telegram_id
+    )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if matched_record:
+        cursor.execute(
+            """
+            UPDATE customers
+            SET first_name = ?, last_name = ?, name = ?, phone = ?, telegram_id = ?, telegram_username = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                str(first_name or "").strip() or matched_record["first_name"] or "",
+                str(last_name or "").strip() or matched_record["last_name"] or "",
+                display_name,
+                matched_record["phone"] or placeholder_phone,
+                normalized_telegram_id,
+                normalized_username or matched_record["telegram_username"],
+                matched_record["id"],
+            ),
+        )
+        customer_id = matched_record["id"]
+    else:
+        cursor.execute(
+            """
+            INSERT INTO customers (first_name, last_name, name, phone, telegram_id, telegram_username, password_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(first_name or "").strip(),
+                str(last_name or "").strip(),
+                display_name,
+                placeholder_phone,
+                normalized_telegram_id,
+                normalized_username or None,
+                None,
+            ),
+        )
+        customer_id = cursor.lastrowid
+
+    conn.commit()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (customer_id,),
     )
     record = cursor.fetchone()
     conn.close()
