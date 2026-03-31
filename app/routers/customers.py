@@ -1,30 +1,26 @@
-import base64
 import hashlib
 import hmac
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode, urlparse
 
-import jwt  # type: ignore
 import requests  # type: ignore
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..auth import verify_token
-from ..config import (
-    TELEGRAM_LOGIN_BOT_TOKEN,
-    TELEGRAM_LOGIN_BOT_USERNAME,
-    TELEGRAM_LOGIN_CLIENT_ID,
-    TELEGRAM_LOGIN_CLIENT_SECRET,
-)
+from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
 from ..customers_database import (
     authenticate_customer,
-    delete_customer_registration_session,
+    complete_customer_registration_session,
     get_all_customers,
+    get_customer_by_id,
     get_customer_record_by_phone,
     get_customer_registration_session,
+    get_latest_customer_registration_session_by_telegram_id,
     hash_password,
+    mark_customer_registration_session_awaiting_contact,
+    mark_customer_registration_session_failed,
     normalize_telegram_username,
     save_customer_registration_session,
     save_or_update_customer_from_telegram,
@@ -33,12 +29,12 @@ from ..customers_database import (
 )
 
 router = APIRouter()
-TELEGRAM_OIDC_AUTH_URL = "https://oauth.telegram.org/auth"
-TELEGRAM_OIDC_TOKEN_URL = "https://oauth.telegram.org/token"
-TELEGRAM_OIDC_JWKS_URL = "https://oauth.telegram.org/.well-known/jwks.json"
-TELEGRAM_OIDC_ISSUER = "https://oauth.telegram.org"
-TELEGRAM_OIDC_SCOPE = "openid profile phone"
-telegram_jwk_client = jwt.PyJWKClient(TELEGRAM_OIDC_JWKS_URL)
+TELEGRAM_BOT_API_BASE_URL = (
+    f"https://api.telegram.org/bot{TELEGRAM_LOGIN_BOT_TOKEN}"
+    if TELEGRAM_LOGIN_BOT_TOKEN
+    else ""
+)
+TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX = "register_"
 
 
 def normalize_phone_number(value: Any) -> str:
@@ -90,143 +86,59 @@ def validate_password(password: str) -> str:
     return normalized_password
 
 
-def validate_redirect_uri(value: str) -> str:
-    redirect_uri = str(value or "").strip()
-    parsed_uri = urlparse(redirect_uri)
-
-    if parsed_uri.scheme not in {"http", "https"} or not parsed_uri.netloc:
-        raise HTTPException(
-            status_code=400,
-            detail="Redirect URI is invalid",
-        )
-
-    return redirect_uri
-
-
 def is_telegram_registration_configured() -> bool:
-    return bool(TELEGRAM_LOGIN_CLIENT_ID and TELEGRAM_LOGIN_CLIENT_SECRET)
+    return bool(TELEGRAM_LOGIN_BOT_USERNAME and TELEGRAM_LOGIN_BOT_TOKEN)
 
 
-def build_pkce_challenge(code_verifier: str) -> str:
-    return base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode("utf-8")).digest()
-    ).decode("utf-8").rstrip("=")
+def build_telegram_registration_deep_link(state: str) -> str:
+    return f"https://t.me/{TELEGRAM_LOGIN_BOT_USERNAME}?start={TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX}{state}"
 
 
-def build_telegram_registration_url(
-    redirect_uri: str,
-    state: str,
-    nonce: str,
-    code_challenge: str,
-) -> str:
-    return (
-        f"{TELEGRAM_OIDC_AUTH_URL}?"
-        + urlencode(
-            {
-                "client_id": TELEGRAM_LOGIN_CLIENT_ID,
-                "redirect_uri": redirect_uri,
-                "response_type": "code",
-                "scope": TELEGRAM_OIDC_SCOPE,
-                "state": state,
-                "nonce": nonce,
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-            }
-        )
-    )
-
-
-def exchange_telegram_code_for_id_token(
-    code: str,
-    redirect_uri: str,
-    code_verifier: str,
-) -> str:
-    credentials = base64.b64encode(
-        f"{TELEGRAM_LOGIN_CLIENT_ID}:{TELEGRAM_LOGIN_CLIENT_SECRET}".encode("utf-8")
-    ).decode("utf-8")
+def call_telegram_bot_api(method: str, payload: dict[str, Any]) -> None:
+    if not TELEGRAM_BOT_API_BASE_URL:
+        return
 
     try:
-        response = requests.post(
-            TELEGRAM_OIDC_TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": TELEGRAM_LOGIN_CLIENT_ID,
-                "code_verifier": code_verifier,
-            },
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+        requests.post(
+            f"{TELEGRAM_BOT_API_BASE_URL}/{method}",
+            json=payload,
             timeout=15,
         )
-    except requests.RequestException as error:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram token exchange failed",
-        ) from error
-
-    if not response.ok:
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-
-        detail = (
-            payload.get("error_description")
-            or payload.get("error")
-            or "Telegram token exchange failed"
-        )
-        raise HTTPException(status_code=502, detail=str(detail))
-
-    try:
-        payload = response.json()
-    except ValueError as error:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram token response is invalid",
-        ) from error
-
-    id_token = str(payload.get("id_token") or "").strip()
-    if not id_token:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram token response is invalid",
-        )
-
-    return id_token
+    except requests.RequestException:
+        return
 
 
-def decode_telegram_id_token(id_token: str, nonce: str) -> dict[str, Any]:
-    try:
-        signing_key = telegram_jwk_client.get_signing_key_from_jwt(id_token)
-        algorithm = str(jwt.get_unverified_header(id_token).get("alg") or "RS256")
-        payload = jwt.decode(
-            id_token,
-            signing_key.key,
-            algorithms=[algorithm],
-            audience=TELEGRAM_LOGIN_CLIENT_ID,
-            issuer=TELEGRAM_OIDC_ISSUER,
-        )
-    except jwt.InvalidTokenError as error:
-        raise HTTPException(
-            status_code=401,
-            detail="Telegram ID token is invalid",
-        ) from error
-    except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail="Telegram identity could not be verified",
-        ) from error
+def send_telegram_text_message(
+    chat_id: str,
+    text: str,
+    *,
+    request_contact: bool = False,
+    remove_keyboard: bool = False,
+) -> None:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+    }
 
-    if str(payload.get("nonce") or "").strip() != str(nonce or "").strip():
-        raise HTTPException(
-            status_code=401,
-            detail="Telegram verification nonce mismatch",
-        )
+    if request_contact:
+        payload["reply_markup"] = {
+            "keyboard": [
+                [
+                    {
+                        "text": "Telefon raqamni yuborish",
+                        "request_contact": True,
+                    }
+                ]
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+    elif remove_keyboard:
+        payload["reply_markup"] = {
+            "remove_keyboard": True,
+        }
 
-    return payload
+    call_telegram_bot_api("sendMessage", payload)
 
 
 class CustomerLoginPayload(BaseModel):
@@ -259,12 +171,15 @@ class CustomerRegisterPayload(BaseModel):
 class CustomerTelegramRegistrationStartPayload(BaseModel):
     name: str
     password: str
-    redirect_uri: str
 
 
-class CustomerTelegramRegistrationCompletePayload(BaseModel):
-    code: str
+class CustomerTelegramRegistrationStatusResponse(BaseModel):
+    success: bool
     state: str
+    status: str
+    bot_url: str | None = None
+    error: str | None = None
+    customer: CustomerResponse | None = None
 
 
 class CustomerResetPasswordPayload(BaseModel):
@@ -347,6 +262,7 @@ def get_telegram_login_config():
 def get_telegram_registration_config():
     return {
         "enabled": is_telegram_registration_configured(),
+        "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
     }
 
 
@@ -409,7 +325,7 @@ def login_customer_with_telegram(payload: CustomerTelegramLoginPayload):
 @router.post(
     "/register/telegram/start",
     summary="Start Telegram registration",
-    description="Starts the Telegram phone verification flow for customer registration.",
+    description="Creates a pending registration and returns a Telegram deep link for phone verification via bot contact sharing.",
 )
 def start_customer_registration_with_telegram(
     payload: CustomerTelegramRegistrationStartPayload,
@@ -422,7 +338,6 @@ def start_customer_registration_with_telegram(
 
     name = str(payload.name or "").strip()
     password = validate_password(payload.password)
-    redirect_uri = validate_redirect_uri(payload.redirect_uri)
 
     if not name:
         raise HTTPException(
@@ -431,53 +346,26 @@ def start_customer_registration_with_telegram(
         )
 
     state = secrets.token_urlsafe(32)
-    nonce = secrets.token_urlsafe(32)
-    code_verifier = secrets.token_urlsafe(64)
-    code_challenge = build_pkce_challenge(code_verifier)
-
     save_customer_registration_session(
         state=state,
-        nonce=nonce,
-        code_verifier=code_verifier,
-        redirect_uri=redirect_uri,
         name=name,
         password_hash=hash_password(password),
     )
 
     return {
         "success": True,
-        "auth_url": build_telegram_registration_url(
-            redirect_uri=redirect_uri,
-            state=state,
-            nonce=nonce,
-            code_challenge=code_challenge,
-        ),
+        "state": state,
+        "bot_url": build_telegram_registration_deep_link(state),
     }
 
 
-@router.post(
-    "/register/telegram/complete",
-    summary="Complete Telegram registration",
-    description="Completes customer registration after Telegram redirects back with an authorization code.",
+@router.get(
+    "/register/telegram/status/{state}",
+    response_model=CustomerTelegramRegistrationStatusResponse,
+    summary="Check Telegram registration status",
+    description="Returns the current state of a pending Telegram-based registration.",
 )
-def complete_customer_registration_with_telegram(
-    payload: CustomerTelegramRegistrationCompletePayload,
-):
-    if not is_telegram_registration_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="Telegram registration is not configured",
-        )
-
-    code = str(payload.code or "").strip()
-    state = str(payload.state or "").strip()
-
-    if not code or not state:
-        raise HTTPException(
-            status_code=400,
-            detail="Telegram authorization payload is incomplete",
-        )
-
+def get_customer_registration_status(state: str):
     registration_session = get_customer_registration_session(state)
     if not registration_session:
         raise HTTPException(
@@ -485,53 +373,144 @@ def complete_customer_registration_with_telegram(
             detail="Telegram registration session expired",
         )
 
-    id_token = exchange_telegram_code_for_id_token(
-        code=code,
-        redirect_uri=str(registration_session["redirect_uri"] or "").strip(),
-        code_verifier=str(registration_session["code_verifier"] or "").strip(),
-    )
-    telegram_payload = decode_telegram_id_token(
-        id_token=id_token,
-        nonce=str(registration_session["nonce"] or "").strip(),
-    )
-
-    normalized_phone = normalize_phone_number(telegram_payload.get("phone_number"))
-    if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
-        raise HTTPException(
-            status_code=400,
-            detail="Please confirm a valid Uzbekistan phone number in Telegram",
-        )
-
-    existing_customer = get_customer_record_by_phone(normalized_phone)
-    if existing_customer and str(existing_customer["password_hash"] or "").strip():
-        raise HTTPException(
-            status_code=409,
-            detail="This phone number is already registered",
-        )
-
-    try:
-        customer = save_customer_account(
-            name=str(registration_session["name"] or "").strip(),
-            phone=normalized_phone,
-            password_hash=str(registration_session["password_hash"] or "").strip(),
-            telegram_username=str(telegram_payload.get("preferred_username") or "").strip()
-            or None,
-            telegram_id=str(telegram_payload.get("id") or "").strip() or None,
-        )
-    except ValueError as error:
-        if str(error) in {"telegram_username_taken", "telegram_id_taken"}:
-            raise HTTPException(
-                status_code=409,
-                detail="This Telegram account is already linked to another profile",
-            ) from error
-        raise
-
-    delete_customer_registration_session(state)
-
+    customer = get_customer_by_id(registration_session["customer_id"])
     return {
         "success": True,
+        "state": str(registration_session["state"] or "").strip(),
+        "status": str(registration_session["status"] or "pending").strip() or "pending",
+        "bot_url": build_telegram_registration_deep_link(state),
+        "error": str(registration_session["last_error"] or "").strip() or None,
         "customer": customer,
     }
+
+
+@router.post("/telegram-bot/webhook", include_in_schema=False)
+def handle_telegram_bot_webhook(update: dict[str, Any] = Body(default={})):
+    if not is_telegram_registration_configured():
+        return {"ok": True}
+
+    message = update.get("message") or {}
+    if not isinstance(message, dict):
+        return {"ok": True}
+
+    sender = message.get("from") or {}
+    chat = message.get("chat") or {}
+    text = str(message.get("text") or "").strip()
+    contact = message.get("contact") or {}
+    telegram_id = str(sender.get("id") or "").strip()
+    chat_id = str(chat.get("id") or "").strip()
+    telegram_username = str(sender.get("username") or "").strip() or None
+
+    if text.startswith("/start"):
+        start_payload = text.split(maxsplit=1)[1].strip() if " " in text else ""
+        if not start_payload.startswith(TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX):
+            send_telegram_text_message(
+                chat_id,
+                "Ro'yxatdan o'tish uchun saytdagi Telegram tugmasini bosing va qaytadan urinib ko'ring.",
+            )
+            return {"ok": True}
+
+        state = start_payload.removeprefix(TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX).strip()
+        registration_session = get_customer_registration_session(state)
+        if not registration_session:
+            send_telegram_text_message(
+                chat_id,
+                "Sessiya tugagan yoki topilmadi. Saytdan ro'yxatdan o'tishni qaytadan boshlang.",
+            )
+            return {"ok": True}
+
+        mark_customer_registration_session_awaiting_contact(
+            state=state,
+            telegram_id=telegram_id,
+            telegram_username=telegram_username,
+            telegram_chat_id=chat_id,
+        )
+        send_telegram_text_message(
+            chat_id,
+            "Ro'yxatdan o'tishni davom ettirish uchun pastdagi tugma orqali telefon raqamingizni yuboring.",
+            request_contact=True,
+        )
+        return {"ok": True}
+
+    if contact and telegram_id:
+        contact_user_id = str(contact.get("user_id") or "").strip()
+        if contact_user_id and contact_user_id != telegram_id:
+            send_telegram_text_message(
+                chat_id,
+                "Faqat o'zingizning telefon raqamingizni yuborishingiz mumkin.",
+            )
+            return {"ok": True}
+
+        registration_session = get_latest_customer_registration_session_by_telegram_id(telegram_id)
+        if not registration_session:
+            send_telegram_text_message(
+                chat_id,
+                "Aktiv ro'yxatdan o'tish sessiyasi topilmadi. Avval saytdan boshlang.",
+            )
+            return {"ok": True}
+
+        state = str(registration_session["state"] or "").strip()
+        normalized_phone = normalize_phone_number(contact.get("phone_number"))
+        if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
+            mark_customer_registration_session_failed(
+                state,
+                "Faqat O'zbekiston telefon raqami bilan ro'yxatdan o'tish mumkin.",
+            )
+            send_telegram_text_message(
+                chat_id,
+                "Faqat O'zbekiston telefon raqami bilan ro'yxatdan o'tish mumkin.",
+                remove_keyboard=True,
+            )
+            return {"ok": True}
+
+        existing_customer = get_customer_record_by_phone(normalized_phone)
+        if existing_customer and str(existing_customer["password_hash"] or "").strip():
+            mark_customer_registration_session_failed(
+                state,
+                "Bu telefon raqami bilan akkaunt allaqachon mavjud.",
+            )
+            send_telegram_text_message(
+                chat_id,
+                "Bu telefon raqami bilan akkaunt allaqachon mavjud.",
+                remove_keyboard=True,
+            )
+            return {"ok": True}
+
+        try:
+            customer = save_customer_account(
+                name=str(registration_session["name"] or "").strip(),
+                phone=normalized_phone,
+                password_hash=str(registration_session["password_hash"] or "").strip(),
+                telegram_username=telegram_username,
+                telegram_id=telegram_id,
+            )
+        except ValueError:
+            mark_customer_registration_session_failed(
+                state,
+                "Telegram profilingiz boshqa akkauntga bog'langan.",
+            )
+            send_telegram_text_message(
+                chat_id,
+                "Telegram profilingiz boshqa akkauntga bog'langan.",
+                remove_keyboard=True,
+            )
+            return {"ok": True}
+
+        complete_customer_registration_session(
+            state=state,
+            phone=normalized_phone,
+            telegram_id=telegram_id,
+            telegram_username=telegram_username,
+            customer_id=customer["id"],
+        )
+        send_telegram_text_message(
+            chat_id,
+            "Telefon raqamingiz tasdiqlandi. Endi saytga qaytib ro'yxatdan o'tishni yakunlang.",
+            remove_keyboard=True,
+        )
+        return {"ok": True}
+
+    return {"ok": True}
 
 
 @router.post("/register", include_in_schema=False)
