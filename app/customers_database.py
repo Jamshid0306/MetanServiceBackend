@@ -2,10 +2,12 @@ import hashlib
 import hmac
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "orders.db"
 PASSWORD_ITERATIONS = 120_000
+REGISTRATION_SESSION_TTL_SECONDS = 10 * 60
 
 
 def get_connection():
@@ -55,6 +57,27 @@ def ensure_customer_columns():
     if "telegram_id" not in existing_columns:
         cursor.execute("ALTER TABLE customers ADD COLUMN telegram_id TEXT")
 
+    conn.commit()
+    conn.close()
+
+
+def init_customer_registration_sessions_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_registration_sessions (
+            state TEXT PRIMARY KEY,
+            nonce TEXT NOT NULL,
+            code_verifier TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -144,6 +167,21 @@ def get_customer_by_phone(phone: str):
     return serialize_customer(get_customer_record_by_phone(phone))
 
 
+def get_all_customers():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        FROM customers
+        ORDER BY created_at DESC, id DESC
+        """
+    )
+    records = cursor.fetchall()
+    conn.close()
+    return [serialize_customer(record) for record in records]
+
+
 def normalize_telegram_username(value: str) -> str:
     username = str(value or "").strip().lstrip("@").lower()
     return username
@@ -190,11 +228,19 @@ def get_customer_record_by_telegram_id(telegram_id: str):
     return record
 
 
-def save_customer_account(name: str, phone: str, password: str, telegram_username: str | None = None):
+def save_customer_account(
+    name: str,
+    phone: str,
+    password: str | None = None,
+    telegram_username: str | None = None,
+    telegram_id: str | None = None,
+    password_hash: str | None = None,
+):
     conn = get_connection()
     cursor = conn.cursor()
     existing_record = get_customer_record_by_phone(phone)
     normalized_username = normalize_telegram_username(telegram_username or "")
+    normalized_telegram_id = str(telegram_id or "").strip()
 
     if normalized_username:
         existing_telegram_record = get_customer_record_by_telegram_username(normalized_username)
@@ -204,16 +250,38 @@ def save_customer_account(name: str, phone: str, password: str, telegram_usernam
             conn.close()
             raise ValueError("telegram_username_taken")
 
-    password_hash = hash_password(password)
+    if normalized_telegram_id:
+        existing_telegram_id_record = get_customer_record_by_telegram_id(normalized_telegram_id)
+        if existing_telegram_id_record and (
+            not existing_record or existing_telegram_id_record["id"] != existing_record["id"]
+        ):
+            conn.close()
+            raise ValueError("telegram_id_taken")
+
+    next_password_hash = str(password_hash or "").strip()
+    if not next_password_hash:
+        raw_password = str(password or "").strip()
+        if not raw_password:
+            conn.close()
+            raise ValueError("password_required")
+        next_password_hash = hash_password(raw_password)
 
     if existing_record:
         cursor.execute(
             """
             UPDATE customers
-            SET first_name = ?, last_name = ?, name = ?, telegram_username = ?, password_hash = ?, updated_at = CURRENT_TIMESTAMP
+            SET first_name = ?, last_name = ?, name = ?, telegram_id = ?, telegram_username = ?, password_hash = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (name, "", name, normalized_username or None, password_hash, existing_record["id"]),
+            (
+                name,
+                "",
+                name,
+                normalized_telegram_id or existing_record["telegram_id"],
+                normalized_username or existing_record["telegram_username"],
+                next_password_hash,
+                existing_record["id"],
+            ),
         )
         customer_id = existing_record["id"]
     else:
@@ -222,7 +290,15 @@ def save_customer_account(name: str, phone: str, password: str, telegram_usernam
             INSERT INTO customers (first_name, last_name, name, phone, telegram_id, telegram_username, password_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, "", name, phone, None, normalized_username or None, password_hash),
+            (
+                name,
+                "",
+                name,
+                phone,
+                normalized_telegram_id or None,
+                normalized_username or None,
+                next_password_hash,
+            ),
         )
         customer_id = cursor.lastrowid
 
@@ -238,6 +314,77 @@ def save_customer_account(name: str, phone: str, password: str, telegram_usernam
     record = cursor.fetchone()
     conn.close()
     return serialize_customer(record)
+
+
+def save_customer_registration_session(
+    state: str,
+    nonce: str,
+    code_verifier: str,
+    redirect_uri: str,
+    name: str,
+    password_hash: str,
+):
+    current_timestamp = int(time.time())
+    expires_at = current_timestamp + REGISTRATION_SESSION_TTL_SECONDS
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM customer_registration_sessions WHERE expires_at <= ?",
+        (current_timestamp,),
+    )
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO customer_registration_sessions (
+            state, nonce, code_verifier, redirect_uri, name, password_hash, expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (state, nonce, code_verifier, redirect_uri, name, password_hash, expires_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_customer_registration_session(state: str):
+    normalized_state = str(state or "").strip()
+    if not normalized_state:
+        return None
+
+    current_timestamp = int(time.time())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM customer_registration_sessions WHERE expires_at <= ?",
+        (current_timestamp,),
+    )
+    cursor.execute(
+        """
+        SELECT state, nonce, code_verifier, redirect_uri, name, password_hash, expires_at, created_at
+        FROM customer_registration_sessions
+        WHERE state = ?
+        """,
+        (normalized_state,),
+    )
+    record = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    return record
+
+
+def delete_customer_registration_session(state: str):
+    normalized_state = str(state or "").strip()
+    if not normalized_state:
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM customer_registration_sessions WHERE state = ?",
+        (normalized_state,),
+    )
+    conn.commit()
+    conn.close()
 
 
 def authenticate_customer(identifier: str, password: str):
@@ -384,3 +531,4 @@ def save_or_update_customer_from_telegram(
 
 init_customers_db()
 ensure_customer_columns()
+init_customer_registration_sessions_db()

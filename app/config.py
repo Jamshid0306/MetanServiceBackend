@@ -27,6 +27,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _resolve_telegram_login_client_id() -> str:
+    explicit_value = os.getenv("TELEGRAM_LOGIN_CLIENT_ID", "").strip()
+    if explicit_value:
+        return explicit_value
+
+    bot_token = os.getenv("TELEGRAM_LOGIN_BOT_TOKEN", "").strip()
+    bot_id = bot_token.split(":", 1)[0].strip()
+    return bot_id if bot_id.isdigit() else ""
+
+
 DEFAULT_PROD_HOSTS = [
     "urganchmetanservice.uz",
     "www.urganchmetanservice.uz",
@@ -54,6 +64,8 @@ ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES = _env_int("ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES"
 ADMIN_REFRESH_TOKEN_EXPIRE_DAYS = _env_int("ADMIN_REFRESH_TOKEN_EXPIRE_DAYS", 30)
 TELEGRAM_LOGIN_BOT_USERNAME = os.getenv("TELEGRAM_LOGIN_BOT_USERNAME", "").strip().lstrip("@")
 TELEGRAM_LOGIN_BOT_TOKEN = os.getenv("TELEGRAM_LOGIN_BOT_TOKEN", "").strip()
+TELEGRAM_LOGIN_CLIENT_ID = _resolve_telegram_login_client_id()
+TELEGRAM_LOGIN_CLIENT_SECRET = os.getenv("TELEGRAM_LOGIN_CLIENT_SECRET", "").strip()
 ICAN_CREDIT_API_URL = os.getenv("ICAN_CREDIT_API_URL", "https://api.credit.icangroup.uz").rstrip("/")
 ICAN_CREDIT_CREATE_PATH = os.getenv("ICAN_CREDIT_CREATE_PATH", "/external/ican/credit/create")
 ICAN_CREDIT_USERNAME = os.getenv("ICAN_CREDIT_USERNAME", "")
