@@ -234,6 +234,22 @@ class CustomerLoginPayload(BaseModel):
     password: str
 
 
+class CustomerResponse(BaseModel):
+    id: int | None = None
+    name: str
+    phone: str
+    telegram_id: str | None = None
+    telegram_username: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class CustomerListResponse(BaseModel):
+    success: bool
+    customers: list[CustomerResponse]
+    total: int
+
+
 class CustomerRegisterPayload(BaseModel):
     name: str
     phone: str
@@ -334,7 +350,12 @@ def get_telegram_registration_config():
     }
 
 
-@router.get("/all")
+@router.get(
+    "/all",
+    response_model=CustomerListResponse,
+    summary="Get all customers",
+    description="Returns the full customer list. Requires an admin bearer token.",
+)
 def list_all_customers(token: dict = Depends(verify_token)):
     customers = get_all_customers()
     return {
@@ -507,48 +528,10 @@ def complete_customer_registration_with_telegram(
 
 @router.post("/register")
 def register_customer(payload: CustomerRegisterPayload):
-    name = payload.name.strip()
-    normalized_phone = normalize_phone_number(payload.phone)
-    password = validate_password(payload.password)
-
-    if not name:
-        raise HTTPException(
-            status_code=400,
-            detail="Name is required",
-        )
-
-    if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
-        raise HTTPException(
-            status_code=400,
-            detail="Enter a valid Uzbekistan phone number",
-        )
-
-    existing_customer = get_customer_record_by_phone(normalized_phone)
-    if existing_customer and str(existing_customer["password_hash"] or "").strip():
-        raise HTTPException(
-            status_code=409,
-            detail="This phone number is already registered",
-        )
-
-    try:
-        customer = save_customer_account(
-            name,
-            normalized_phone,
-            password=password,
-            telegram_username=None,
-        )
-    except ValueError as error:
-        if str(error) == "telegram_username_taken":
-            raise HTTPException(
-                status_code=409,
-                detail="This profile could not be created",
-            ) from error
-        raise
-
-    return {
-        "success": True,
-        "customer": customer,
-    }
+    raise HTTPException(
+        status_code=403,
+        detail="Registration is only available through Telegram verification",
+    )
 
 
 @router.post("/reset-password")
