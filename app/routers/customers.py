@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 from typing import Any
@@ -29,6 +30,7 @@ from ..customers_database import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 TELEGRAM_BOT_API_BASE_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_LOGIN_BOT_TOKEN}"
     if TELEGRAM_LOGIN_BOT_TOKEN
@@ -94,18 +96,56 @@ def build_telegram_registration_deep_link(state: str) -> str:
     return f"https://t.me/{TELEGRAM_LOGIN_BOT_USERNAME}?start={TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX}{state}"
 
 
-def call_telegram_bot_api(method: str, payload: dict[str, Any]) -> None:
+def call_telegram_bot_api(
+    method: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not TELEGRAM_BOT_API_BASE_URL:
-        return
+        logger.warning("Telegram bot API call skipped for %s because bot token is missing", method)
+        return None
 
     try:
-        requests.post(
+        response = requests.post(
             f"{TELEGRAM_BOT_API_BASE_URL}/{method}",
-            json=payload,
+            json=payload or {},
             timeout=15,
         )
-    except requests.RequestException:
-        return
+    except requests.RequestException as error:
+        logger.exception("Telegram bot API request failed for %s: %s", method, error)
+        return None
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        logger.error(
+            "Telegram bot API returned non-JSON response for %s: status=%s body=%s",
+            method,
+            response.status_code,
+            response.text[:500],
+        )
+        return None
+
+    if response.status_code >= 400 or not response_payload.get("ok"):
+        logger.error(
+            "Telegram bot API call failed for %s: status=%s payload=%s response=%s",
+            method,
+            response.status_code,
+            payload,
+            response_payload,
+        )
+
+    return response_payload
+
+
+def get_telegram_api_error_detail(
+    response_payload: dict[str, Any] | None,
+    fallback: str,
+) -> str:
+    if not response_payload:
+        return fallback
+
+    detail = str(response_payload.get("description") or "").strip()
+    return detail or fallback
 
 
 def send_telegram_text_message(
@@ -188,6 +228,20 @@ class CustomerResetPasswordPayload(BaseModel):
     reset_token: str | None = None
 
 
+class TelegramBotWebhookInfoResponse(BaseModel):
+    success: bool
+    configured: bool
+    bot_username: str | None = None
+    webhook_url: str | None = None
+    pending_update_count: int = 0
+    last_error_date: int | None = None
+    last_error_message: str | None = None
+
+
+class TelegramBotWebhookSetPayload(BaseModel):
+    url: str
+
+
 class CustomerTelegramLoginPayload(BaseModel):
     id: int | str
     first_name: str | None = None
@@ -264,6 +318,81 @@ def get_telegram_registration_config():
         "enabled": is_telegram_registration_configured(),
         "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
     }
+
+
+@router.get(
+    "/telegram-bot/webhook-info",
+    response_model=TelegramBotWebhookInfoResponse,
+    summary="Get Telegram bot webhook info",
+    description="Returns the webhook status reported by Telegram Bot API. Requires an admin bearer token.",
+)
+def get_telegram_bot_webhook_info(token: dict = Depends(verify_token)):
+    if not is_telegram_registration_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram registration is not configured",
+        )
+
+    response_payload = call_telegram_bot_api("getWebhookInfo")
+    if not response_payload or not response_payload.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=get_telegram_api_error_detail(
+                response_payload,
+                "Telegram webhook info could not be loaded",
+            ),
+        )
+
+    result = response_payload.get("result") or {}
+    webhook_url = str(result.get("url") or "").strip() or None
+    return {
+        "success": True,
+        "configured": bool(webhook_url),
+        "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
+        "webhook_url": webhook_url,
+        "pending_update_count": int(result.get("pending_update_count") or 0),
+        "last_error_date": result.get("last_error_date"),
+        "last_error_message": str(result.get("last_error_message") or "").strip() or None,
+    }
+
+
+@router.post(
+    "/telegram-bot/webhook/setup",
+    response_model=TelegramBotWebhookInfoResponse,
+    summary="Set Telegram bot webhook",
+    description="Registers a webhook URL in Telegram Bot API for customer registration updates. Requires an admin bearer token.",
+)
+def set_telegram_bot_webhook(
+    payload: TelegramBotWebhookSetPayload,
+    token: dict = Depends(verify_token),
+):
+    if not is_telegram_registration_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram registration is not configured",
+        )
+
+    webhook_url = str(payload.url or "").strip()
+    if not webhook_url.startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="Webhook URL must start with https://",
+        )
+
+    response_payload = call_telegram_bot_api(
+        "setWebhook",
+        {"url": webhook_url},
+    )
+    if not response_payload or not response_payload.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=get_telegram_api_error_detail(
+                response_payload,
+                "Telegram webhook could not be configured",
+            ),
+        )
+
+    return get_telegram_bot_webhook_info(token)
 
 
 @router.get(
@@ -387,6 +516,7 @@ def get_customer_registration_status(state: str):
 @router.post("/telegram-bot/webhook", include_in_schema=False)
 def handle_telegram_bot_webhook(update: dict[str, Any] = Body(default={})):
     if not is_telegram_registration_configured():
+        logger.warning("Ignored Telegram update because registration is not configured")
         return {"ok": True}
 
     message = update.get("message") or {}
@@ -403,6 +533,11 @@ def handle_telegram_bot_webhook(update: dict[str, Any] = Body(default={})):
 
     if text.startswith("/start"):
         start_payload = text.split(maxsplit=1)[1].strip() if " " in text else ""
+        logger.info(
+            "Received Telegram /start for chat_id=%s payload=%s",
+            chat_id or None,
+            start_payload or None,
+        )
         if not start_payload.startswith(TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX):
             send_telegram_text_message(
                 chat_id,
@@ -433,6 +568,11 @@ def handle_telegram_bot_webhook(update: dict[str, Any] = Body(default={})):
         return {"ok": True}
 
     if contact and telegram_id:
+        logger.info(
+            "Received Telegram contact for chat_id=%s telegram_id=%s",
+            chat_id or None,
+            telegram_id,
+        )
         contact_user_id = str(contact.get("user_id") or "").strip()
         if contact_user_id and contact_user_id != telegram_id:
             send_telegram_text_message(
