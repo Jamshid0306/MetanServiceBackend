@@ -406,7 +406,11 @@ def login_customer_with_telegram(payload: CustomerTelegramLoginPayload):
     }
 
 
-@router.post("/register/telegram/start")
+@router.post(
+    "/register/telegram/start",
+    summary="Start Telegram registration",
+    description="Starts the Telegram phone verification flow for customer registration.",
+)
 def start_customer_registration_with_telegram(
     payload: CustomerTelegramRegistrationStartPayload,
 ):
@@ -451,7 +455,11 @@ def start_customer_registration_with_telegram(
     }
 
 
-@router.post("/register/telegram/complete")
+@router.post(
+    "/register/telegram/complete",
+    summary="Complete Telegram registration",
+    description="Completes customer registration after Telegram redirects back with an authorization code.",
+)
 def complete_customer_registration_with_telegram(
     payload: CustomerTelegramRegistrationCompletePayload,
 ):
@@ -526,7 +534,7 @@ def complete_customer_registration_with_telegram(
     }
 
 
-@router.post("/register")
+@router.post("/register", include_in_schema=False)
 def register_customer(payload: CustomerRegisterPayload):
     raise HTTPException(
         status_code=403,
