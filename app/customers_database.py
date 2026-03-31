@@ -256,6 +256,25 @@ def get_all_customers():
     return [serialize_customer(record) for record in records]
 
 
+def delete_customer_by_id(customer_id: int | str):
+    record = get_customer_record_by_id(customer_id)
+    if not record:
+        return None
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        DELETE FROM customers
+        WHERE id = ?
+        """,
+        (record["id"],),
+    )
+    conn.commit()
+    conn.close()
+    return serialize_customer(record)
+
+
 def normalize_telegram_username(value: str) -> str:
     username = str(value or "").strip().lstrip("@").lower()
     return username

@@ -14,6 +14,7 @@ from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
 from ..customers_database import (
     authenticate_customer,
     complete_customer_registration_session,
+    delete_customer_by_id,
     get_all_customers,
     get_customer_by_id,
     get_customer_record_by_phone,
@@ -200,6 +201,12 @@ class CustomerListResponse(BaseModel):
     success: bool
     customers: list[CustomerResponse]
     total: int
+
+
+class CustomerDeleteResponse(BaseModel):
+    success: bool
+    customer: CustomerResponse
+    detail: str
 
 
 class CustomerRegisterPayload(BaseModel):
@@ -407,6 +414,27 @@ def list_all_customers(token: dict = Depends(verify_token)):
         "success": True,
         "customers": customers,
         "total": len(customers),
+    }
+
+
+@router.delete(
+    "/{customer_id}",
+    response_model=CustomerDeleteResponse,
+    summary="Delete customer by ID",
+    description="Deletes a customer by ID. Requires an admin bearer token.",
+)
+def delete_customer(customer_id: int, token: dict = Depends(verify_token)):
+    customer = delete_customer_by_id(customer_id)
+    if not customer:
+        raise HTTPException(
+            status_code=404,
+            detail="Customer was not found",
+        )
+
+    return {
+        "success": True,
+        "customer": customer,
+        "detail": "Customer deleted successfully",
     }
 
 
