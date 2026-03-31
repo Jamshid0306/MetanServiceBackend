@@ -8,6 +8,7 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parent.parent / "orders.db"
 PASSWORD_ITERATIONS = 120_000
 REGISTRATION_SESSION_TTL_SECONDS = 10 * 60
+LOGIN_SESSION_TTL_SECONDS = 10 * 60
 
 
 def get_connection():
@@ -57,6 +58,30 @@ def ensure_customer_columns():
     if "telegram_id" not in existing_columns:
         cursor.execute("ALTER TABLE customers ADD COLUMN telegram_id TEXT")
 
+    conn.commit()
+    conn.close()
+
+
+def init_customer_login_sessions_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_login_sessions (
+            state TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending',
+            phone TEXT,
+            telegram_id TEXT,
+            telegram_username TEXT,
+            telegram_chat_id TEXT,
+            last_error TEXT,
+            verified_at TIMESTAMP,
+            customer_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -256,6 +281,56 @@ def get_all_customers():
     return [serialize_customer(record) for record in records]
 
 
+def update_customer_telegram_by_phone(
+    phone: str,
+    telegram_id: str | None = None,
+    telegram_username: str | None = None,
+):
+    existing_record = get_customer_record_by_phone(str(phone or "").strip())
+    if not existing_record:
+        return None
+
+    normalized_username = normalize_telegram_username(telegram_username or "")
+    normalized_telegram_id = str(telegram_id or "").strip()
+
+    if normalized_username:
+        existing_telegram_record = get_customer_record_by_telegram_username(normalized_username)
+        if existing_telegram_record and existing_telegram_record["id"] != existing_record["id"]:
+            raise ValueError("telegram_username_taken")
+
+    if normalized_telegram_id:
+        existing_telegram_id_record = get_customer_record_by_telegram_id(normalized_telegram_id)
+        if existing_telegram_id_record and existing_telegram_id_record["id"] != existing_record["id"]:
+            raise ValueError("telegram_id_taken")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE customers
+        SET telegram_id = ?, telegram_username = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            normalized_telegram_id or existing_record["telegram_id"],
+            normalized_username or existing_record["telegram_username"],
+            existing_record["id"],
+        ),
+    )
+    conn.commit()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (existing_record["id"],),
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return serialize_customer(record)
+
+
 def delete_customer_by_id(customer_id: int | str):
     record = get_customer_record_by_id(customer_id)
     if not record:
@@ -431,6 +506,154 @@ def save_customer_registration_session(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (state, "", "", "", name, password_hash, expires_at, "pending"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_customer_login_session(state: str):
+    current_timestamp = int(time.time())
+    expires_at = current_timestamp + LOGIN_SESSION_TTL_SECONDS
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM customer_login_sessions WHERE expires_at <= ?",
+        (current_timestamp,),
+    )
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO customer_login_sessions (
+            state, expires_at, status
+        )
+        VALUES (?, ?, ?)
+        """,
+        (state, expires_at, "pending"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_customer_login_session(state: str):
+    normalized_state = str(state or "").strip()
+    if not normalized_state:
+        return None
+
+    current_timestamp = int(time.time())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM customer_login_sessions WHERE expires_at <= ?",
+        (current_timestamp,),
+    )
+    cursor.execute(
+        """
+        SELECT state, expires_at, created_at, status, phone, telegram_id, telegram_username,
+               telegram_chat_id, last_error, verified_at, customer_id
+        FROM customer_login_sessions
+        WHERE state = ?
+        """,
+        (normalized_state,),
+    )
+    record = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    return record
+
+
+def get_latest_customer_login_session_by_telegram_id(telegram_id: str):
+    normalized_telegram_id = str(telegram_id or "").strip()
+    if not normalized_telegram_id:
+        return None
+
+    current_timestamp = int(time.time())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM customer_login_sessions WHERE expires_at <= ?",
+        (current_timestamp,),
+    )
+    cursor.execute(
+        """
+        SELECT state, expires_at, created_at, status, phone, telegram_id, telegram_username,
+               telegram_chat_id, last_error, verified_at, customer_id
+        FROM customer_login_sessions
+        WHERE telegram_id = ? AND status IN ('pending', 'awaiting_contact')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (normalized_telegram_id,),
+    )
+    record = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    return record
+
+
+def mark_customer_login_session_awaiting_contact(
+    state: str,
+    telegram_id: str,
+    telegram_username: str | None = None,
+    telegram_chat_id: str | None = None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE customer_login_sessions
+        SET telegram_id = ?, telegram_username = ?, telegram_chat_id = ?, status = 'awaiting_contact',
+            last_error = NULL
+        WHERE state = ?
+        """,
+        (
+            str(telegram_id or "").strip() or None,
+            normalize_telegram_username(telegram_username or "") or None,
+            str(telegram_chat_id or "").strip() or None,
+            str(state or "").strip(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_customer_login_session_failed(state: str, error_message: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE customer_login_sessions
+        SET status = 'failed', last_error = ?
+        WHERE state = ?
+        """,
+        (str(error_message or "").strip(), str(state or "").strip()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def complete_customer_login_session(
+    state: str,
+    phone: str,
+    telegram_id: str,
+    telegram_username: str | None,
+    customer_id: int | str | None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE customer_login_sessions
+        SET status = 'completed', phone = ?, telegram_id = ?, telegram_username = ?, verified_at = CURRENT_TIMESTAMP,
+            customer_id = ?, last_error = NULL
+        WHERE state = ?
+        """,
+        (
+            str(phone or "").strip() or None,
+            str(telegram_id or "").strip() or None,
+            normalize_telegram_username(telegram_username or "") or None,
+            int(customer_id) if str(customer_id or "").isdigit() else None,
+            str(state or "").strip(),
+        ),
     )
     conn.commit()
     conn.close()
@@ -720,5 +943,6 @@ def save_or_update_customer_from_telegram(
 
 init_customers_db()
 ensure_customer_columns()
+init_customer_login_sessions_db()
 init_customer_registration_sessions_db()
 ensure_customer_registration_session_columns()

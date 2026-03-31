@@ -14,19 +14,27 @@ from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
 from ..customers_database import (
     authenticate_customer,
     complete_customer_registration_session,
+    complete_customer_login_session,
     delete_customer_by_id,
     get_all_customers,
     get_customer_by_id,
+    get_customer_by_phone,
+    get_customer_login_session,
     get_customer_record_by_phone,
+    get_latest_customer_login_session_by_telegram_id,
     get_customer_registration_session,
     get_latest_customer_registration_session_by_telegram_id,
     hash_password,
+    mark_customer_login_session_awaiting_contact,
+    mark_customer_login_session_failed,
     mark_customer_registration_session_awaiting_contact,
     mark_customer_registration_session_failed,
     normalize_telegram_username,
+    save_customer_login_session,
     save_customer_registration_session,
     save_or_update_customer_from_telegram,
     save_customer_account,
+    update_customer_telegram_by_phone,
     update_customer_password_by_phone,
 )
 
@@ -38,6 +46,7 @@ TELEGRAM_BOT_API_BASE_URL = (
     else ""
 )
 TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX = "register_"
+TELEGRAM_LOGIN_DEEP_LINK_PREFIX = "login_"
 
 
 def normalize_phone_number(value: Any) -> str:
@@ -95,6 +104,10 @@ def is_telegram_registration_configured() -> bool:
 
 def build_telegram_registration_deep_link(state: str) -> str:
     return f"https://t.me/{TELEGRAM_LOGIN_BOT_USERNAME}?start={TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX}{state}"
+
+
+def build_telegram_login_deep_link(state: str) -> str:
+    return f"https://t.me/{TELEGRAM_LOGIN_BOT_USERNAME}?start={TELEGRAM_LOGIN_DEEP_LINK_PREFIX}{state}"
 
 
 def call_telegram_bot_api(
@@ -229,6 +242,15 @@ class CustomerTelegramRegistrationStatusResponse(BaseModel):
     customer: CustomerResponse | None = None
 
 
+class CustomerTelegramLoginStatusResponse(BaseModel):
+    success: bool
+    state: str
+    status: str
+    bot_url: str | None = None
+    error: str | None = None
+    customer: CustomerResponse | None = None
+
+
 class CustomerResetPasswordPayload(BaseModel):
     phone: str
     password: str
@@ -311,7 +333,7 @@ def validate_telegram_login(payload: CustomerTelegramLoginPayload) -> None:
         )
 
 
-@router.get("/telegram-login/config")
+@router.get("/telegram-login/config", include_in_schema=False)
 def get_telegram_login_config():
     return {
         "enabled": bool(TELEGRAM_LOGIN_BOT_USERNAME and TELEGRAM_LOGIN_BOT_TOKEN),
@@ -458,23 +480,55 @@ def login_customer(payload: CustomerLoginPayload):
 
 @router.post("/telegram-login")
 def login_customer_with_telegram(payload: CustomerTelegramLoginPayload):
-    validate_telegram_login(payload)
+    raise HTTPException(
+        status_code=410,
+        detail="Telegram widget login is disabled. Use Telegram bot phone verification instead.",
+    )
 
-    try:
-        customer = save_or_update_customer_from_telegram(
-            telegram_id=str(payload.id),
-            first_name=str(payload.first_name or "").strip(),
-            last_name=str(payload.last_name or "").strip(),
-            telegram_username=payload.username,
-        )
-    except ValueError as error:
+
+@router.post(
+    "/login/telegram/start",
+    summary="Start Telegram bot login",
+    description="Creates a pending login session and returns a Telegram deep link for phone verification via bot contact sharing.",
+)
+def start_customer_login_with_telegram():
+    if not is_telegram_registration_configured():
         raise HTTPException(
-            status_code=409,
-            detail="Telegram account could not be linked",
-        ) from error
+            status_code=503,
+            detail="Telegram login is not configured",
+        )
+
+    state = secrets.token_urlsafe(32)
+    save_customer_login_session(state=state)
 
     return {
         "success": True,
+        "state": state,
+        "bot_url": build_telegram_login_deep_link(state),
+    }
+
+
+@router.get(
+    "/login/telegram/status/{state}",
+    response_model=CustomerTelegramLoginStatusResponse,
+    summary="Check Telegram bot login status",
+    description="Returns the current state of a pending Telegram bot login.",
+)
+def get_customer_login_status(state: str):
+    login_session = get_customer_login_session(state)
+    if not login_session:
+        raise HTTPException(
+            status_code=410,
+            detail="Telegram login session expired",
+        )
+
+    customer = get_customer_by_id(login_session["customer_id"])
+    return {
+        "success": True,
+        "state": str(login_session["state"] or "").strip(),
+        "status": str(login_session["status"] or "pending").strip() or "pending",
+        "bot_url": build_telegram_login_deep_link(state),
+        "error": str(login_session["last_error"] or "").strip() or None,
         "customer": customer,
     }
 
@@ -566,6 +620,29 @@ def handle_telegram_bot_webhook(update: dict[str, Any] = Body(default={})):
             chat_id or None,
             start_payload or None,
         )
+        if start_payload.startswith(TELEGRAM_LOGIN_DEEP_LINK_PREFIX):
+            state = start_payload.removeprefix(TELEGRAM_LOGIN_DEEP_LINK_PREFIX).strip()
+            login_session = get_customer_login_session(state)
+            if not login_session:
+                send_telegram_text_message(
+                    chat_id,
+                    "Sessiya tugagan yoki topilmadi. Saytdan kirishni qaytadan boshlang.",
+                )
+                return {"ok": True}
+
+            mark_customer_login_session_awaiting_contact(
+                state=state,
+                telegram_id=telegram_id,
+                telegram_username=telegram_username,
+                telegram_chat_id=chat_id,
+            )
+            send_telegram_text_message(
+                chat_id,
+                "Kirishni davom ettirish uchun pastdagi tugma orqali telefon raqamingizni yuboring.",
+                request_contact=True,
+            )
+            return {"ok": True}
+
         if not start_payload.startswith(TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX):
             send_telegram_text_message(
                 chat_id,
@@ -609,11 +686,72 @@ def handle_telegram_bot_webhook(update: dict[str, Any] = Body(default={})):
             )
             return {"ok": True}
 
+        login_session = get_latest_customer_login_session_by_telegram_id(telegram_id)
+        if login_session:
+            state = str(login_session["state"] or "").strip()
+            normalized_phone = normalize_phone_number(contact.get("phone_number"))
+            if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
+                mark_customer_login_session_failed(
+                    state,
+                    "Faqat O'zbekiston telefon raqami bilan kirish mumkin.",
+                )
+                send_telegram_text_message(
+                    chat_id,
+                    "Faqat O'zbekiston telefon raqami bilan kirish mumkin.",
+                    remove_keyboard=True,
+                )
+                return {"ok": True}
+
+            customer = get_customer_by_phone(normalized_phone)
+            if not customer:
+                mark_customer_login_session_failed(
+                    state,
+                    "Bu telefon raqami bilan akkaunt topilmadi.",
+                )
+                send_telegram_text_message(
+                    chat_id,
+                    "Bu telefon raqami bilan akkaunt topilmadi.",
+                    remove_keyboard=True,
+                )
+                return {"ok": True}
+
+            try:
+                customer = update_customer_telegram_by_phone(
+                    phone=normalized_phone,
+                    telegram_id=telegram_id,
+                    telegram_username=telegram_username,
+                ) or customer
+            except ValueError:
+                mark_customer_login_session_failed(
+                    state,
+                    "Telegram profilingiz boshqa akkauntga bog'langan.",
+                )
+                send_telegram_text_message(
+                    chat_id,
+                    "Telegram profilingiz boshqa akkauntga bog'langan.",
+                    remove_keyboard=True,
+                )
+                return {"ok": True}
+
+            complete_customer_login_session(
+                state=state,
+                phone=normalized_phone,
+                telegram_id=telegram_id,
+                telegram_username=telegram_username,
+                customer_id=customer["id"],
+            )
+            send_telegram_text_message(
+                chat_id,
+                "Telefon raqamingiz tasdiqlandi. Endi saytga qaytib kirishni yakunlang.",
+                remove_keyboard=True,
+            )
+            return {"ok": True}
+
         registration_session = get_latest_customer_registration_session_by_telegram_id(telegram_id)
         if not registration_session:
             send_telegram_text_message(
                 chat_id,
-                "Aktiv ro'yxatdan o'tish sessiyasi topilmadi. Avval saytdan boshlang.",
+                "Aktiv sessiya topilmadi. Avval saytdan qaytadan boshlang.",
             )
             return {"ok": True}
 
@@ -711,3 +849,10 @@ def reset_customer_password(payload: CustomerResetPasswordPayload):
         "success": True,
         "customer": customer,
     }
+@router.get("/login/telegram/config")
+def get_telegram_bot_login_config():
+    return {
+        "enabled": is_telegram_registration_configured(),
+        "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
+    }
+
