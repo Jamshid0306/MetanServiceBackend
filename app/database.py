@@ -207,10 +207,14 @@ def _ensure_extra_services_schema() -> None:
                     characteristic_en TEXT,
                     price_uz VARCHAR NOT NULL,
                     price_ru VARCHAR NOT NULL,
-                    price_en VARCHAR NOT NULL
+                    price_en VARCHAR NOT NULL,
+                    image_path VARCHAR
                 )
                 """
             )
+
+        if _table_exists(cursor, "extra_services") and not _column_exists(cursor, "extra_services", "image_path"):
+            cursor.execute("ALTER TABLE extra_services ADD COLUMN image_path VARCHAR")
 
         if not _table_exists(cursor, "product_extra_services"):
             cursor.execute(

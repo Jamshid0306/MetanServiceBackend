@@ -5,8 +5,8 @@ from typing import Any, List, Optional
 from uuid import uuid4
 
 import requests  # type: ignore
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session, load_only
 
 from .. import models
@@ -58,6 +58,16 @@ def save_file(file: UploadFile) -> str:
     with filepath.open("wb") as buffer:
         buffer.write(file.file.read())
     return f"/static/images/{filename}"
+
+
+def delete_asset_file(asset_path: str | None) -> None:
+    if not asset_path:
+        return
+
+    full_path = BACKEND_DIR / asset_path.lstrip("/")
+    if full_path.exists():
+        os.remove(full_path)
+
 
 def parse_numeric_price(price: Optional[Any]) -> Optional[float]:
     if price is None:
@@ -389,6 +399,7 @@ def serialize_service(
         "price_uz": service.price_uz,
         "price_ru": service.price_ru,
         "price_en": service.price_en,
+        "image_path": service.image_path,
         "product_ids": attached_product_ids or [],
     }
 
@@ -1137,6 +1148,71 @@ class ExtraServicePayload(BaseModel):
     product_ids: list[int] = Field(default_factory=list)
 
 
+def parse_service_product_ids(raw_value: Any) -> list[int]:
+    if isinstance(raw_value, list):
+        return normalize_product_id_list(raw_value)
+
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip()
+        if not normalized:
+            return []
+
+        try:
+            parsed = json.loads(normalized)
+        except json.JSONDecodeError:
+            parsed = [item.strip() for item in normalized.split(",")]
+
+        if isinstance(parsed, list):
+            return normalize_product_id_list(parsed)
+
+        return []
+
+    return normalize_product_id_list([raw_value])
+
+
+async def parse_extra_service_request(
+    request: Request,
+) -> tuple[ExtraServicePayload, UploadFile | None]:
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload_data: dict[str, Any]
+    file: UploadFile | None = None
+
+    if "application/json" in content_type:
+        raw_payload = await request.json()
+        if not isinstance(raw_payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid service payload")
+        payload_data = dict(raw_payload)
+    else:
+        form = await request.form()
+        payload_data = {
+            "name_uz": form.get("name_uz", ""),
+            "name_ru": form.get("name_ru", ""),
+            "name_en": form.get("name_en", ""),
+            "characteristic_uz": form.get("characteristic_uz", ""),
+            "characteristic_ru": form.get("characteristic_ru", ""),
+            "characteristic_en": form.get("characteristic_en", ""),
+            "price_uz": form.get("price_uz", ""),
+            "price_ru": form.get("price_ru", ""),
+            "price_en": form.get("price_en", ""),
+            "product_ids": form.get("product_ids", "[]"),
+        }
+        file_candidate = form.get("file")
+        if getattr(file_candidate, "filename", ""):
+            file = file_candidate
+
+    payload_data["product_ids"] = parse_service_product_ids(payload_data.get("product_ids"))
+
+    try:
+        payload = ExtraServicePayload(**payload_data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    return payload, file
+
+
 @router.get("/services")
 def get_extra_services(
     db: Session = Depends(get_db),
@@ -1155,11 +1231,12 @@ def get_extra_services(
 
 
 @router.post("/services")
-def create_extra_service(
-    payload: ExtraServicePayload,
+async def create_extra_service(
+    request: Request,
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
 ):
+    payload, file = await parse_extra_service_request(request)
     service = models.ExtraService(
         name_uz=payload.name_uz.strip(),
         name_ru=payload.name_ru.strip(),
@@ -1170,6 +1247,7 @@ def create_extra_service(
         price_uz=payload.price_uz.strip(),
         price_ru=payload.price_ru.strip(),
         price_en=payload.price_en.strip(),
+        image_path=save_file(file) if file is not None else None,
     )
 
     db.add(service)
@@ -1192,12 +1270,13 @@ def create_extra_service(
 
 
 @router.put("/services/{service_id}")
-def update_extra_service(
+async def update_extra_service(
     service_id: int,
-    payload: ExtraServicePayload,
+    request: Request,
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
 ):
+    payload, file = await parse_extra_service_request(request)
     service = db.query(models.ExtraService).filter(models.ExtraService.id == service_id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
@@ -1211,6 +1290,12 @@ def update_extra_service(
     service.price_uz = payload.price_uz.strip()
     service.price_ru = payload.price_ru.strip()
     service.price_en = payload.price_en.strip()
+
+    if file is not None:
+        new_image_path = save_file(file)
+        delete_asset_file(service.image_path)
+        service.image_path = new_image_path
+
     normalized_product_ids = normalize_product_id_list(payload.product_ids)
     sync_service_product_links(
         db,
@@ -1239,6 +1324,7 @@ def delete_extra_service(
     db.query(models.ProductExtraService).filter(
         models.ProductExtraService.service_id == service_id
     ).delete(synchronize_session=False)
+    delete_asset_file(service.image_path)
     db.delete(service)
     db.commit()
     return {"success": True, "service_id": service_id}

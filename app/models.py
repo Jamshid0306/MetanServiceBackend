@@ -57,6 +57,7 @@ class ExtraService(Base):
     price_uz = Column(String, nullable=False)
     price_ru = Column(String, nullable=False)
     price_en = Column(String, nullable=False)
+    image_path = Column(String, nullable=True)
 
 
 class ProductExtraService(Base):
