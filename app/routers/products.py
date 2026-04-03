@@ -1026,6 +1026,7 @@ class OrderPayload(BaseModel):
     total: float = 0
     locale: str = "uz"
     order_type: str = "standard"
+    payment_method: str = "cash"
     credit: Optional[CreditOrderPayload] = None
 
 
@@ -1565,6 +1566,7 @@ def create_order(payload: OrderPayload):
     products = payload.products or []
     phone_digits = "".join(ch for ch in phone if ch.isdigit())
     order_type = (payload.order_type or "standard").strip().lower()
+    payment_method = (payload.payment_method or "cash").strip().lower()
 
     if not name or not phone or len(phone_digits) < 9 or not products:
         raise HTTPException(status_code=400, detail="Name, phone and products are required")
@@ -1572,9 +1574,15 @@ def create_order(payload: OrderPayload):
     if order_type not in {"standard", "credit"}:
         raise HTTPException(status_code=400, detail="Unsupported order type")
 
+    if payment_method not in {"cash", "credit"}:
+        raise HTTPException(status_code=400, detail="Unsupported payment method")
+
+    resolved_payment_method = "credit" if order_type == "credit" else payment_method
+
     response_payload: dict[str, Any] = {
         "success": True,
         "order_type": order_type,
+        "payment_method": resolved_payment_method,
     }
 
     if order_type == "credit":
@@ -1589,6 +1597,7 @@ def create_order(payload: OrderPayload):
         products=products,
         total=float(payload.total or 0),
         locale=(payload.locale or "uz").strip() or "uz",
+        payment_method=resolved_payment_method,
     )
 
     return response_payload
