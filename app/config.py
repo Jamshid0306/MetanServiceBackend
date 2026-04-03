@@ -42,37 +42,17 @@ def _resolve_telegram_login_client_id() -> str:
 
 
 DEFAULT_PROD_HOSTS = [
-    "urganchmetanservice.uz",
-    "www.urganchmetanservice.uz",
     "urganch-metan-servis.uz",
-    "www.urganch-metan-servis.uz",
 ]
 
 DEFAULT_CORS_ORIGINS = [
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:4173",
-    "http://localhost:4173",
+    "http://localhost:3000",
     *[f"https://{host}" for host in DEFAULT_PROD_HOSTS],
-    *[f"http://{host}" for host in DEFAULT_PROD_HOSTS],
 ]
 
 configured_cors_origins = _split_csv(os.getenv("CORS_ORIGINS", ""))
 CORS_ORIGINS = list(dict.fromkeys([*DEFAULT_CORS_ORIGINS, *configured_cors_origins]))
-CORS_ALLOW_ORIGIN_REGEX = _env_str(
-    "CORS_ALLOW_ORIGIN_REGEX",
-    r"^https?://("
-    r"localhost"
-    r"|127\.0\.0\.1"
-    r"|0\.0\.0\.0"
-    r"|192\.168\.\d{1,3}\.\d{1,3}"
-    r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
-    r"|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}"
-    r"|[a-z0-9-]+\.ngrok-free\.app"
-    r"|[a-z0-9-]+\.ngrok\.io"
-    r")(:\d+)?$",
-)
+CORS_ALLOW_ORIGIN_REGEX = _env_str("CORS_ALLOW_ORIGIN_REGEX", "")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key_here")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
