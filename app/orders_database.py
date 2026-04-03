@@ -34,7 +34,7 @@ MIGRATION_COLUMNS: dict[str, str] = {
     "merchant_confirm_id": "INTEGER",
     "click_error": "INTEGER",
     "click_error_note": "TEXT",
-    "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    "updated_at": "TIMESTAMP",
 }
 
 
