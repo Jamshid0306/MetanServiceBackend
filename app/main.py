@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .config import CORS_ORIGINS, STATIC_DIR
+from .config import CORS_ALLOW_ORIGIN_REGEX, CORS_ORIGINS, STATIC_DIR
 from .database import init_db
 from .routers import admin, customers, hero_slides, payments, products
 
@@ -15,6 +15,7 @@ init_db()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

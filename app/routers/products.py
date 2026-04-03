@@ -24,6 +24,7 @@ from ..config import (
 )
 from ..database import get_db
 from ..orders_database import save_order
+from ..telegram_notifications import send_cash_order_notification
 
 router = APIRouter()
 CONFIG_SCHEMA_VERSION = 6
@@ -1591,7 +1592,7 @@ def create_order(payload: OrderPayload):
 
         response_payload["credit"] = submit_ican_credit_request(payload.credit, products)
 
-    save_order(
+    order_record = save_order(
         name=name,
         phone=phone,
         products=products,
@@ -1599,6 +1600,9 @@ def create_order(payload: OrderPayload):
         locale=(payload.locale or "uz").strip() or "uz",
         payment_method=resolved_payment_method,
     )
+
+    if resolved_payment_method == "cash":
+        send_cash_order_notification(order_record)
 
     return response_payload
 

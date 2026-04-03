@@ -27,6 +27,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
 def _resolve_telegram_login_client_id() -> str:
     explicit_value = os.getenv("TELEGRAM_LOGIN_CLIENT_ID", "").strip()
     if explicit_value:
@@ -56,6 +60,19 @@ DEFAULT_CORS_ORIGINS = [
 
 configured_cors_origins = _split_csv(os.getenv("CORS_ORIGINS", ""))
 CORS_ORIGINS = list(dict.fromkeys([*DEFAULT_CORS_ORIGINS, *configured_cors_origins]))
+CORS_ALLOW_ORIGIN_REGEX = _env_str(
+    "CORS_ALLOW_ORIGIN_REGEX",
+    r"^https?://("
+    r"localhost"
+    r"|127\.0\.0\.1"
+    r"|0\.0\.0\.0"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}"
+    r"|[a-z0-9-]+\.ngrok-free\.app"
+    r"|[a-z0-9-]+\.ngrok\.io"
+    r")(:\d+)?$",
+)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key_here")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -66,6 +83,8 @@ TELEGRAM_LOGIN_BOT_USERNAME = os.getenv("TELEGRAM_LOGIN_BOT_USERNAME", "").strip
 TELEGRAM_LOGIN_BOT_TOKEN = os.getenv("TELEGRAM_LOGIN_BOT_TOKEN", "").strip()
 TELEGRAM_LOGIN_CLIENT_ID = _resolve_telegram_login_client_id()
 TELEGRAM_LOGIN_CLIENT_SECRET = os.getenv("TELEGRAM_LOGIN_CLIENT_SECRET", "").strip()
+TELEGRAM_ORDER_BOT_TOKEN = os.getenv("TELEGRAM_ORDER_BOT_TOKEN", TELEGRAM_LOGIN_BOT_TOKEN).strip()
+TELEGRAM_ORDER_CHAT_ID = os.getenv("TELEGRAM_ORDER_CHAT_ID", "").strip()
 ICAN_CREDIT_API_URL = os.getenv("ICAN_CREDIT_API_URL", "https://api.credit.icangroup.uz").rstrip("/")
 ICAN_CREDIT_CREATE_PATH = os.getenv("ICAN_CREDIT_CREATE_PATH", "/external/ican/credit/create")
 ICAN_CREDIT_USERNAME = os.getenv("ICAN_CREDIT_USERNAME", "")
