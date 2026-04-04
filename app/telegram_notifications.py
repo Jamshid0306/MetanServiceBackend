@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import requests  # type: ignore
@@ -33,11 +34,25 @@ def _format_phone(phone: Any) -> str:
 
 
 def _format_total(total: Any) -> str:
-    digits = "".join(ch for ch in str(total or "") if ch.isdigit())
-    if not digits:
-        return str(total or "0")
-    numeric = int(digits)
-    return f"{numeric:,}".replace(",", " ") + " UZS"
+    raw_value = str(total or "").strip()
+    if not raw_value:
+        return "0 UZS"
+
+    try:
+        numeric = Decimal(str(total))
+    except (InvalidOperation, ValueError):
+        digits = "".join(ch for ch in raw_value if ch.isdigit())
+        if not digits:
+            return f"{raw_value} UZS"
+        numeric = Decimal(digits)
+
+    normalized = numeric.quantize(Decimal("0.01")).normalize()
+    if normalized == normalized.to_integral_value():
+        amount = f"{int(normalized):,}".replace(",", " ")
+    else:
+        amount = format(normalized, ",f").rstrip("0").rstrip(".").replace(",", " ")
+
+    return f"{amount} UZS"
 
 
 def _format_option_line(option: dict[str, Any]) -> str:

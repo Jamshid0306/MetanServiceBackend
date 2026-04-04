@@ -21,6 +21,12 @@ ORDER_COLUMNS = [
     "merchant_confirm_id",
     "click_error",
     "click_error_note",
+    "myid_session_id",
+    "myid_external_id",
+    "myid_job_id",
+    "myid_result_code",
+    "myid_result_note",
+    "myid_profile",
     "created_at",
     "updated_at",
 ]
@@ -34,6 +40,12 @@ MIGRATION_COLUMNS: dict[str, str] = {
     "merchant_confirm_id": "INTEGER",
     "click_error": "INTEGER",
     "click_error_note": "TEXT",
+    "myid_session_id": "TEXT",
+    "myid_external_id": "TEXT",
+    "myid_job_id": "TEXT",
+    "myid_result_code": "INTEGER",
+    "myid_result_note": "TEXT",
+    "myid_profile": "TEXT",
     "updated_at": "TIMESTAMP",
 }
 
@@ -69,6 +81,12 @@ def init_db() -> None:
             merchant_confirm_id INTEGER,
             click_error INTEGER,
             click_error_note TEXT,
+            myid_session_id TEXT,
+            myid_external_id TEXT,
+            myid_job_id TEXT,
+            myid_result_code INTEGER,
+            myid_result_note TEXT,
+            myid_profile TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -120,12 +138,31 @@ def _deserialize_products(raw_value: Any) -> list[Any]:
     return payload if isinstance(payload, list) else []
 
 
+def _serialize_json_object(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _deserialize_json_object(raw_value: Any) -> dict[str, Any] | None:
+    if not raw_value:
+        return None
+
+    try:
+        payload = json.loads(raw_value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+    return payload if isinstance(payload, dict) else None
+
+
 def _row_to_order(row: sqlite3.Row | tuple[Any, ...] | None) -> dict[str, Any] | None:
     if row is None:
         return None
 
     payload = dict(row)
     payload["products"] = _deserialize_products(payload.get("products"))
+    payload["myid_profile"] = _deserialize_json_object(payload.get("myid_profile"))
     return payload
 
 
@@ -144,6 +181,12 @@ def create_order(
     merchant_confirm_id: int | None = None,
     click_error: int | None = None,
     click_error_note: str | None = None,
+    myid_session_id: str | None = None,
+    myid_external_id: str | None = None,
+    myid_job_id: str | None = None,
+    myid_result_code: int | None = None,
+    myid_result_note: str | None = None,
+    myid_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     conn = _get_connection()
     try:
@@ -163,9 +206,15 @@ def create_order(
                 merchant_prepare_id,
                 merchant_confirm_id,
                 click_error,
-                click_error_note
+                click_error_note,
+                myid_session_id,
+                myid_external_id,
+                myid_job_id,
+                myid_result_code,
+                myid_result_note,
+                myid_profile
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -181,6 +230,12 @@ def create_order(
                 merchant_confirm_id,
                 click_error,
                 click_error_note,
+                myid_session_id,
+                myid_external_id,
+                myid_job_id,
+                myid_result_code,
+                myid_result_note,
+                _serialize_json_object(myid_profile),
             ),
         )
         order_id = int(cursor.lastrowid)
@@ -227,6 +282,12 @@ def update_order(order_id: int, **fields: Any) -> dict[str, Any] | None:
         "merchant_confirm_id",
         "click_error",
         "click_error_note",
+        "myid_session_id",
+        "myid_external_id",
+        "myid_job_id",
+        "myid_result_code",
+        "myid_result_note",
+        "myid_profile",
     }
 
     updates: dict[str, Any] = {}
@@ -235,6 +296,8 @@ def update_order(order_id: int, **fields: Any) -> dict[str, Any] | None:
             continue
         if key == "products":
             updates[key] = _serialize_products(value or [])
+        elif key == "myid_profile":
+            updates[key] = _serialize_json_object(value)
         else:
             updates[key] = value
 
@@ -298,6 +361,21 @@ def get_order_by_prepare_id(merchant_prepare_id: int) -> dict[str, Any] | None:
         cursor.execute(
             f"SELECT {', '.join(ORDER_COLUMNS)} FROM orders WHERE merchant_prepare_id = ?",
             (merchant_prepare_id,),
+        )
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+
+    return _row_to_order(row)
+
+
+def get_order_by_myid_session_id(myid_session_id: str) -> dict[str, Any] | None:
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {', '.join(ORDER_COLUMNS)} FROM orders WHERE myid_session_id = ?",
+            (str(myid_session_id).strip(),),
         )
         row = cursor.fetchone()
     finally:
