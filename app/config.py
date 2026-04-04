@@ -43,6 +43,7 @@ def _resolve_telegram_login_client_id() -> str:
 
 DEFAULT_PROD_HOSTS = [
     "urganch-metan-servis.uz",
+    "urganchmetanservice.uz",
 ]
 
 DEFAULT_CORS_ORIGINS = [
