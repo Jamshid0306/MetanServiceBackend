@@ -5,6 +5,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from time import sleep
 from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
@@ -32,6 +33,7 @@ from ..config import (
     MYID_CLIENT_ID,
     MYID_CLIENT_SECRET,
     MYID_CONNECT_TIMEOUT,
+    MYID_HTTP_RETRY_COUNT,
     MYID_MAX_RETRIES,
     MYID_METHOD,
     MYID_READ_TIMEOUT,
@@ -792,6 +794,42 @@ def _extract_client_ip(request: Request) -> str:
     return str(request.client.host).strip() if request.client else ""
 
 
+def _myid_http_attempt_count() -> int:
+    return max(1, min(int(MYID_HTTP_RETRY_COUNT or 1), 5))
+
+
+def _request_myid(method: str, path: str, *, failure_message: str, **kwargs: Any) -> requests.Response:
+    url = f"{MYID_BASE_URL}{path}"
+    attempts = _myid_http_attempt_count()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return requests.request(
+                method,
+                url,
+                timeout=MYID_REQUEST_TIMEOUT,
+                **kwargs,
+            )
+        except requests.Timeout as exc:
+            if attempt >= attempts:
+                raise HTTPException(
+                    status_code=504,
+                    detail="MyID serveriga ulanish vaqti tugadi. Birozdan keyin qayta urinib ko'ring.",
+                ) from exc
+        except requests.ConnectionError as exc:
+            if attempt >= attempts:
+                raise HTTPException(
+                    status_code=502,
+                    detail="MyID serveriga ulanishda xatolik bo'ldi. Birozdan keyin qayta urinib ko'ring.",
+                ) from exc
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"{failure_message}: {exc}") from exc
+
+        sleep(min(0.5 * attempt, 2))
+
+    raise HTTPException(status_code=502, detail=failure_message)
+
+
 def _myid_cached_client_token() -> str:
     access_token = str(MYID_CLIENT_TOKEN_CACHE.get("access_token") or "").strip()
     expires_at = MYID_CLIENT_TOKEN_CACHE.get("expires_at")
@@ -847,15 +885,13 @@ def _myid_request_access_token(
         form_data["method"] = MYID_METHOD
         form_data["scope"] = MYID_SCOPE
 
-    try:
-        response = requests.post(
-            f"{MYID_BASE_URL}/api/v1/oauth2/access-token",
-            data=form_data,
-            headers={"Accept": "application/json"},
-            timeout=MYID_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"MyID token request failed: {exc}") from exc
+    response = _request_myid(
+        "POST",
+        "/api/v1/oauth2/access-token",
+        failure_message="MyID token request failed",
+        data=form_data,
+        headers={"Accept": "application/json"},
+    )
 
     if response.status_code >= 400:
         detail = _extract_upstream_error_detail(response)
@@ -888,18 +924,16 @@ def _myid_create_session(request: Request) -> tuple[str, str]:
         "ip_address": _extract_client_ip(request),
     }
 
-    try:
-        response = requests.post(
-            f"{MYID_BASE_URL}/api/v1/web/sessions",
-            json=payload,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {access_token}",
-            },
-            timeout=MYID_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"MyID session creation failed: {exc}") from exc
+    response = _request_myid(
+        "POST",
+        "/api/v1/web/sessions",
+        failure_message="MyID session creation failed",
+        json=payload,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
 
     if response.status_code >= 400:
         detail = _extract_upstream_error_detail(response)
@@ -1000,14 +1034,12 @@ def _myid_client_bearer_headers() -> dict[str, str]:
 
 
 def _myid_fetch_session_result(session_id: str) -> dict[str, Any]:
-    try:
-        response = requests.post(
-            f"{MYID_BASE_URL}/api/v1/web/sessions/{session_id}/result",
-            headers=_myid_client_bearer_headers(),
-            timeout=MYID_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"MyID session result request failed: {exc}") from exc
+    response = _request_myid(
+        "POST",
+        f"/api/v1/web/sessions/{session_id}/result",
+        failure_message="MyID session result request failed",
+        headers=_myid_client_bearer_headers(),
+    )
 
     if response.status_code >= 400:
         detail = _extract_upstream_error_detail(response)
@@ -1025,15 +1057,13 @@ def _myid_fetch_session_result(session_id: str) -> dict[str, Any]:
 
 
 def _myid_close_session(session_id: str, close_code: int) -> dict[str, Any]:
-    try:
-        response = requests.post(
-            f"{MYID_BASE_URL}/api/v1/web/sessions/{session_id}/client/close",
-            json={"code": close_code},
-            headers=_myid_client_bearer_headers(),
-            timeout=MYID_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"MyID session close request failed: {exc}") from exc
+    response = _request_myid(
+        "POST",
+        f"/api/v1/web/sessions/{session_id}/client/close",
+        failure_message="MyID session close request failed",
+        json={"code": close_code},
+        headers=_myid_client_bearer_headers(),
+    )
 
     if response.status_code >= 400:
         detail = _extract_upstream_error_detail(response)
