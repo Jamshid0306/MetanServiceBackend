@@ -42,6 +42,13 @@ def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name, "").strip().lower()
+    if not raw_value:
+        return default
+    return raw_value in {"1", "true", "yes", "on"}
+
+
 def _resolve_telegram_login_client_id() -> str:
     explicit_value = os.getenv("TELEGRAM_LOGIN_CLIENT_ID", "").strip()
     if explicit_value:
@@ -102,3 +109,4 @@ MYID_MAX_RETRIES = _env_int("MYID_MAX_RETRIES", 3)
 MYID_HTTP_RETRY_COUNT = _env_int("MYID_HTTP_RETRY_COUNT", 2)
 MYID_CONNECT_TIMEOUT = _env_float("MYID_CONNECT_TIMEOUT", 15)
 MYID_READ_TIMEOUT = _env_float("MYID_READ_TIMEOUT", 30)
+MYID_DEBUG_LOGS = _env_bool("MYID_DEBUG_LOGS", False)

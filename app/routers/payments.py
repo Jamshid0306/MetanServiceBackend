@@ -2,10 +2,11 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any
 from uuid import uuid4
 from urllib.parse import urlencode
@@ -33,6 +34,7 @@ from ..config import (
     MYID_CLIENT_ID,
     MYID_CLIENT_SECRET,
     MYID_CONNECT_TIMEOUT,
+    MYID_DEBUG_LOGS,
     MYID_HTTP_RETRY_COUNT,
     MYID_MAX_RETRIES,
     MYID_METHOD,
@@ -55,6 +57,7 @@ from ..orders_database import (
 
 router = APIRouter()
 click_router = APIRouter(prefix="/click")
+logger = logging.getLogger(__name__)
 MYID_REQUEST_TIMEOUT = (MYID_CONNECT_TIMEOUT, MYID_READ_TIMEOUT)
 
 CLICK_ERROR_SIGNATURE = -1
@@ -798,31 +801,134 @@ def _myid_http_attempt_count() -> int:
     return max(1, min(int(MYID_HTTP_RETRY_COUNT or 1), 5))
 
 
+def _mask_debug_value(value: Any) -> Any:
+    if value is None:
+        return None
+
+    text = str(value)
+    if len(text) <= 4:
+        return "***"
+
+    return f"{text[:2]}***{text[-2:]}"
+
+
+def _sanitize_myid_debug_payload(value: Any) -> Any:
+    sensitive_keys = {
+        "authorization",
+        "client_secret",
+        "access_token",
+        "refresh_token",
+        "code",
+        "auth_code",
+        "pinfl",
+        "pass_data",
+        "birth_date",
+    }
+
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in sensitive_keys:
+                sanitized[key] = _mask_debug_value(item)
+            elif isinstance(item, (dict, list)):
+                sanitized[key] = _sanitize_myid_debug_payload(item)
+            else:
+                sanitized[key] = item
+        return sanitized
+
+    if isinstance(value, list):
+        return [_sanitize_myid_debug_payload(item) for item in value]
+
+    return value
+
+
+def _myid_debug_context(kwargs: dict[str, Any]) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    for key in ("data", "json", "headers", "params"):
+        if key in kwargs:
+            context[key] = _sanitize_myid_debug_payload(kwargs.get(key))
+    return context
+
+
 def _request_myid(method: str, path: str, *, failure_message: str, **kwargs: Any) -> requests.Response:
     url = f"{MYID_BASE_URL}{path}"
     attempts = _myid_http_attempt_count()
+    debug_context = _myid_debug_context(kwargs) if MYID_DEBUG_LOGS else {}
 
     for attempt in range(1, attempts + 1):
+        started_at = perf_counter()
+        if MYID_DEBUG_LOGS:
+            logger.info(
+                "MyID request start method=%s path=%s attempt=%s/%s timeout=%s payload=%s",
+                method,
+                path,
+                attempt,
+                attempts,
+                MYID_REQUEST_TIMEOUT,
+                debug_context,
+            )
+
         try:
-            return requests.request(
+            response = requests.request(
                 method,
                 url,
                 timeout=MYID_REQUEST_TIMEOUT,
                 **kwargs,
             )
+            if MYID_DEBUG_LOGS:
+                logger.info(
+                    "MyID request done method=%s path=%s attempt=%s/%s status=%s elapsed_ms=%s",
+                    method,
+                    path,
+                    attempt,
+                    attempts,
+                    response.status_code,
+                    int((perf_counter() - started_at) * 1000),
+                )
+            return response
         except requests.Timeout as exc:
+            if MYID_DEBUG_LOGS:
+                logger.warning(
+                    "MyID request timeout method=%s path=%s attempt=%s/%s elapsed_ms=%s",
+                    method,
+                    path,
+                    attempt,
+                    attempts,
+                    int((perf_counter() - started_at) * 1000),
+                )
             if attempt >= attempts:
                 raise HTTPException(
                     status_code=504,
                     detail="MyID serveriga ulanish vaqti tugadi. Birozdan keyin qayta urinib ko'ring.",
                 ) from exc
         except requests.ConnectionError as exc:
+            if MYID_DEBUG_LOGS:
+                logger.warning(
+                    "MyID request connection error method=%s path=%s attempt=%s/%s elapsed_ms=%s error=%s",
+                    method,
+                    path,
+                    attempt,
+                    attempts,
+                    int((perf_counter() - started_at) * 1000),
+                    exc,
+                )
             if attempt >= attempts:
                 raise HTTPException(
                     status_code=502,
                     detail="MyID serveriga ulanishda xatolik bo'ldi. Birozdan keyin qayta urinib ko'ring.",
                 ) from exc
         except requests.RequestException as exc:
+            if MYID_DEBUG_LOGS:
+                logger.warning(
+                    "MyID request failed method=%s path=%s attempt=%s/%s elapsed_ms=%s error=%s",
+                    method,
+                    path,
+                    attempt,
+                    attempts,
+                    int((perf_counter() - started_at) * 1000),
+                    exc,
+                )
             raise HTTPException(status_code=502, detail=f"{failure_message}: {exc}") from exc
 
         sleep(min(0.5 * attempt, 2))
@@ -1298,6 +1404,17 @@ def initiate_myid_payment(
     birth_date = _normalize_birth_date(payload.birth_date)
     redirect_uri = _resolve_myid_redirect_uri(request, payload.redirect_uri)
 
+    if MYID_DEBUG_LOGS:
+        logger.info(
+            "MyID initiate received origin=%s redirect_uri=%s explicit_redirect_uri=%s products_count=%s has_pinfl=%s has_pass_data=%s",
+            _get_request_origin(request),
+            redirect_uri,
+            str(payload.redirect_uri or "").strip(),
+            len(products),
+            bool(pinfl),
+            bool(pass_data),
+        )
+
     if not _myid_is_configured():
         raise HTTPException(status_code=500, detail="MyID integration is not configured")
 
@@ -1343,6 +1460,16 @@ def initiate_myid_payment(
         is_resident=payload.is_resident,
         lang=payload.lang or payload.locale,
     )
+
+    if MYID_DEBUG_LOGS:
+        logger.info(
+            "MyID initiate redirect built order_id=%s session_id=%s external_id=%s redirect_uri=%s web_base_url=%s",
+            int(order["id"]),
+            _mask_debug_value(session_id),
+            _mask_debug_value(external_id),
+            redirect_uri_with_order,
+            MYID_WEB_BASE_URL,
+        )
 
     return {
         "success": True,
