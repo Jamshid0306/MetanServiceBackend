@@ -765,10 +765,10 @@ def _get_request_origin(request: Request) -> str:
 def _resolve_myid_redirect_uri(request: Request, explicit_url: str | None) -> str:
     configured = str(explicit_url or "").strip() or MYID_REDIRECT_URL
     if configured:
-        return configured
+        return _append_query_params(configured, {"myid_popup": "1"})
 
     origin = _get_request_origin(request)
-    return f"{origin}/checkout" if origin else ""
+    return _append_query_params(f"{origin}/checkout", {"myid_popup": "1"}) if origin else ""
 
 
 def _extract_client_ip(request: Request) -> str:
