@@ -31,8 +31,10 @@ from ..config import (
     MYID_BASE_URL,
     MYID_CLIENT_ID,
     MYID_CLIENT_SECRET,
+    MYID_CONNECT_TIMEOUT,
     MYID_MAX_RETRIES,
     MYID_METHOD,
+    MYID_READ_TIMEOUT,
     MYID_REDIRECT_URL,
     MYID_SCOPE,
     MYID_WEB_BASE_URL,
@@ -51,6 +53,7 @@ from ..orders_database import (
 
 router = APIRouter()
 click_router = APIRouter(prefix="/click")
+MYID_REQUEST_TIMEOUT = (MYID_CONNECT_TIMEOUT, MYID_READ_TIMEOUT)
 
 CLICK_ERROR_SIGNATURE = -1
 CLICK_ERROR_AMOUNT = -2
@@ -763,7 +766,7 @@ def _get_request_origin(request: Request) -> str:
 
 
 def _resolve_myid_redirect_uri(request: Request, explicit_url: str | None) -> str:
-    configured = str(explicit_url or "").strip() or MYID_REDIRECT_URL
+    configured = MYID_REDIRECT_URL or str(explicit_url or "").strip()
     if configured:
         return _append_query_params(configured, {"myid_popup": "1"})
 
@@ -849,7 +852,7 @@ def _myid_request_access_token(
             f"{MYID_BASE_URL}/api/v1/oauth2/access-token",
             data=form_data,
             headers={"Accept": "application/json"},
-            timeout=15,
+            timeout=MYID_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"MyID token request failed: {exc}") from exc
@@ -893,7 +896,7 @@ def _myid_create_session(request: Request) -> tuple[str, str]:
                 "Accept": "application/json",
                 "Authorization": f"Bearer {access_token}",
             },
-            timeout=15,
+            timeout=MYID_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"MyID session creation failed: {exc}") from exc
@@ -1001,7 +1004,7 @@ def _myid_fetch_session_result(session_id: str) -> dict[str, Any]:
         response = requests.post(
             f"{MYID_BASE_URL}/api/v1/web/sessions/{session_id}/result",
             headers=_myid_client_bearer_headers(),
-            timeout=15,
+            timeout=MYID_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"MyID session result request failed: {exc}") from exc
@@ -1027,7 +1030,7 @@ def _myid_close_session(session_id: str, close_code: int) -> dict[str, Any]:
             f"{MYID_BASE_URL}/api/v1/web/sessions/{session_id}/client/close",
             json={"code": close_code},
             headers=_myid_client_bearer_headers(),
-            timeout=15,
+            timeout=MYID_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"MyID session close request failed: {exc}") from exc

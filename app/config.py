@@ -27,6 +27,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
 def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -88,3 +99,5 @@ MYID_REDIRECT_URL = os.getenv("MYID_REDIRECT_URL", "").strip()
 MYID_SCOPE = os.getenv("MYID_SCOPE", "common_data").strip()
 MYID_METHOD = os.getenv("MYID_METHOD", "strong").strip().lower() or "strong"
 MYID_MAX_RETRIES = _env_int("MYID_MAX_RETRIES", 3)
+MYID_CONNECT_TIMEOUT = _env_float("MYID_CONNECT_TIMEOUT", 5)
+MYID_READ_TIMEOUT = _env_float("MYID_READ_TIMEOUT", 10)
