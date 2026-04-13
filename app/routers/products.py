@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from pathlib import Path
 from typing import Any, List, Optional
 from uuid import uuid4
@@ -19,6 +20,7 @@ from ..config import (
     ICAN_CREDIT_DEFAULT_PAYMENT_DAY,
     ICAN_CREDIT_EMPLOYEE_ID,
     ICAN_CREDIT_PASSWORD,
+    ICAN_CREDIT_TARIFF_PATH,
     ICAN_CREDIT_USERNAME,
     IMAGES_DIR,
 )
@@ -44,6 +46,8 @@ SUMMARY_PRODUCT_COLUMNS = (
     models.Product.credit_percent,
     models.Product.credit_6m_percent,
     models.Product.credit_plans,
+    models.Product.initial_payment_enabled,
+    models.Product.initial_payment_amount,
     models.Product.config_options,
     models.Product.images,
     models.Product.order,
@@ -77,6 +81,24 @@ def parse_numeric_price(price: Optional[Any]) -> Optional[float]:
     if not digits:
         return None
     return float(digits)
+
+
+def parse_decimal_number(value: Optional[Any]) -> Optional[float]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        return numeric if numeric == numeric else None
+
+    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0).replace(",", "."))
+    except ValueError:
+        return None
 
 
 def parse_bool_flag(value: Optional[Any]) -> bool:
@@ -212,6 +234,146 @@ def extract_upstream_error_detail(response: requests.Response) -> str:
         return text[:500]
 
     return "Credit service request failed."
+
+
+def parse_positive_int(value: Optional[Any]) -> Optional[int]:
+    parsed = parse_decimal_number(value)
+    if parsed is None:
+        return None
+
+    numeric = int(parsed)
+    return numeric if numeric > 0 else None
+
+
+def format_percent_value(value: float) -> float | int:
+    rounded = round(float(value), 2)
+    if rounded.is_integer():
+        return int(rounded)
+    return rounded
+
+
+def extract_ican_tariff_months(item: dict[str, Any]) -> Optional[int]:
+    name = str(item.get("name") or "").strip()
+    name_match = re.search(r"(\d+)", name)
+    if name_match:
+        months = int(name_match.group(1))
+        if months > 0:
+            return months
+
+    min_period = parse_positive_int(item.get("min_period"))
+    max_period = parse_positive_int(item.get("max_period"))
+
+    if min_period is not None and max_period is not None and min_period == max_period:
+        return min_period
+
+    return max_period or min_period
+
+
+def normalize_ican_tariff_item(item: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(item, dict) or parse_bool_flag(item.get("is_deleted")):
+        return None
+
+    tariff_id = parse_positive_int(item.get("id"))
+    months = extract_ican_tariff_months(item)
+    monthly_percent = parse_decimal_number(item.get("percent"))
+
+    if tariff_id is None or months is None or monthly_percent is None or monthly_percent <= 0:
+        return None
+
+    min_amount = parse_numeric_price(item.get("min_amount"))
+    max_amount = parse_numeric_price(item.get("max_amount"))
+    name = str(item.get("name") or "").strip() or f"{months} oylik"
+
+    return {
+        "id": tariff_id,
+        "name": name,
+        "months": months,
+        "percent": format_percent_value(monthly_percent * months),
+        "monthly_percent": format_percent_value(monthly_percent),
+        "min_amount": int(min_amount) if min_amount is not None else None,
+        "max_amount": int(max_amount) if max_amount is not None else None,
+        "company_id": parse_positive_int(item.get("company_id")),
+        "type": str(item.get("type") or "").strip(),
+        "period_type": str(item.get("period_type") or "").strip(),
+        "created_at": str(item.get("created_at") or "").strip(),
+        "updated_at": str(item.get("updated_at") or "").strip(),
+    }
+
+
+def normalize_ican_tariffs(items: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen_months: set[int] = set()
+
+    for item in items:
+        tariff = normalize_ican_tariff_item(item)
+        if tariff is None or tariff["months"] in seen_months:
+            continue
+        normalized.append(tariff)
+        seen_months.add(tariff["months"])
+
+    normalized.sort(key=lambda tariff: (tariff["months"], tariff["id"]))
+    return normalized
+
+
+def fetch_ican_credit_tariffs() -> dict[str, Any]:
+    if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
+        raise HTTPException(
+            status_code=500,
+            detail="ICAN credit integration credentials are not configured",
+        )
+
+    tariff_url = f"{ICAN_CREDIT_API_URL}{ICAN_CREDIT_TARIFF_PATH}"
+
+    try:
+        response = requests.get(
+            tariff_url,
+            auth=(ICAN_CREDIT_USERNAME, ICAN_CREDIT_PASSWORD),
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ICAN credit tariff service is unavailable: {exc}",
+        ) from exc
+
+    if response.status_code >= 400:
+        detail = extract_upstream_error_detail(response)
+        raise HTTPException(
+            status_code=502,
+            detail=f"ICAN credit tariff service returned an error: {detail}",
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit tariff service returned an invalid response",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit tariff service returned an unexpected response",
+        )
+
+    raw_items = payload.get("data")
+    if not isinstance(raw_items, list):
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit tariff service returned an unexpected response",
+        )
+
+    normalized_tariffs = normalize_ican_tariffs(raw_items)
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+
+    return {
+        "data": normalized_tariffs,
+        "meta": {
+            **meta,
+            "total": len(normalized_tariffs),
+        },
+    }
 
 
 def submit_ican_credit_request(
@@ -1049,6 +1211,8 @@ def serialize_product(product: models.Product, include_full_details: bool = True
         "credit_percent": credit_percent,
         "credit_6m_percent": product.credit_6m_percent,
         "credit_plans": credit_plans,
+        "initial_payment_enabled": bool(getattr(product, "initial_payment_enabled", 0)),
+        "initial_payment_amount": getattr(product, "initial_payment_amount", None),
         "config_options": normalize_config_options(product.config_options),
         "images": product.images.split(",") if product.images else [],
         "is_active": bool(getattr(product, "is_active", 1)),
@@ -1104,6 +1268,11 @@ def get_products(
         "offset": offset,
         "products": result,
     }
+
+
+@router.get("/credit/tariffs")
+def get_credit_tariffs():
+    return fetch_ican_credit_tariffs()
 
 
 @router.get("/filter")
@@ -1352,6 +1521,8 @@ async def create_product(
     credit_months: str = Form(""),
     credit_percent: str = Form(""),
     credit_6m_percent: str = Form(""),
+    initial_payment_enabled: str = Form("false"),
+    initial_payment_amount: str = Form(""),
     config_options: str = Form(""),
     order: str = Form("999999"),
     is_active: str = Form("true"),
@@ -1361,6 +1532,8 @@ async def create_product(
 ):
     image_urls = [save_file(file) for file in files] if files else []
     is_credit_enabled = parse_bool_flag(credit_enabled)
+    is_initial_payment_enabled = is_credit_enabled and parse_bool_flag(initial_payment_enabled)
+    parsed_initial_payment_amount = int(parse_numeric_price(initial_payment_amount) or 0)
     order_value = int(order) if str(order).strip().isdigit() else 999999
     is_active_value = 1 if parse_bool_flag(is_active) else 0
     parsed_credit_plans = normalize_credit_plans(credit_plans)
@@ -1376,8 +1549,8 @@ async def create_product(
                 }
             ]
 
-    if is_credit_enabled and not parsed_credit_plans:
-        raise HTTPException(status_code=400, detail="At least one credit plan is required")
+    if is_initial_payment_enabled and parsed_initial_payment_amount <= 0:
+        raise HTTPException(status_code=400, detail="Initial payment amount is required")
 
     primary_credit_plan = parsed_credit_plans[0] if parsed_credit_plans else None
     six_month_plan = next(
@@ -1408,6 +1581,10 @@ async def create_product(
             else None
         ),
         credit_plans=dump_credit_plans(parsed_credit_plans) if is_credit_enabled else None,
+        initial_payment_enabled=int(is_initial_payment_enabled),
+        initial_payment_amount=(
+            parsed_initial_payment_amount if is_initial_payment_enabled else None
+        ),
         config_options=dump_config_options(config_options),
         images=",".join(image_urls) if image_urls else None,
         order=order_value,
@@ -1442,6 +1619,8 @@ async def update_product(
     credit_months: str = Form(""),
     credit_percent: str = Form(""),
     credit_6m_percent: str = Form(""),
+    initial_payment_enabled: str = Form("false"),
+    initial_payment_amount: str = Form(""),
     config_options: str = Form(""),
     order: str = Form("999999"),
     is_active: str = Form("true"),
@@ -1455,6 +1634,8 @@ async def update_product(
         raise HTTPException(status_code=404, detail="Product not found")
 
     is_credit_enabled = parse_bool_flag(credit_enabled)
+    is_initial_payment_enabled = is_credit_enabled and parse_bool_flag(initial_payment_enabled)
+    parsed_initial_payment_amount = int(parse_numeric_price(initial_payment_amount) or 0)
     parsed_credit_plans = normalize_credit_plans(credit_plans)
 
     if not parsed_credit_plans:
@@ -1468,8 +1649,8 @@ async def update_product(
                 }
             ]
 
-    if is_credit_enabled and not parsed_credit_plans:
-        raise HTTPException(status_code=400, detail="At least one credit plan is required")
+    if is_initial_payment_enabled and parsed_initial_payment_amount <= 0:
+        raise HTTPException(status_code=400, detail="Initial payment amount is required")
 
     primary_credit_plan = parsed_credit_plans[0] if parsed_credit_plans else None
     six_month_plan = next(
@@ -1503,6 +1684,10 @@ async def update_product(
         else None
     )
     product.credit_plans = dump_credit_plans(parsed_credit_plans) if product.credit_enabled else None
+    product.initial_payment_enabled = int(is_initial_payment_enabled)
+    product.initial_payment_amount = (
+        parsed_initial_payment_amount if is_initial_payment_enabled else None
+    )
     product.config_options = dump_config_options(config_options)
     order_value = int(order) if str(order).strip().isdigit() else 999999
     product.order = order_value

@@ -26,6 +26,8 @@ class Product(Base):
     credit_percent = Column(Integer, nullable=True)
     credit_6m_percent = Column(Integer, nullable=True)
     credit_plans = Column(Text, nullable=True)
+    initial_payment_enabled = Column(Integer, nullable=False, default=0)
+    initial_payment_amount = Column(Integer, nullable=True)
     config_options = Column(Text, nullable=True)
     images = Column(String, nullable=True)
     # Display order for frontend listing (smaller = first; same order → by id).

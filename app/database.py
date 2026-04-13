@@ -59,6 +59,8 @@ def _migrate_to_products_only_schema() -> None:
                     credit_percent INTEGER,
                     credit_6m_percent INTEGER,
                     credit_plans TEXT,
+                    initial_payment_enabled INTEGER NOT NULL DEFAULT 0,
+                    initial_payment_amount INTEGER,
                     config_options TEXT,
                     images VARCHAR
                 )
@@ -73,6 +75,7 @@ def _migrate_to_products_only_schema() -> None:
                     default_price,
                     price_uz, price_ru, price_en,
                     credit_enabled, credit_months, credit_percent, credit_6m_percent, credit_plans,
+                    initial_payment_enabled, initial_payment_amount,
                     config_options, images
                 )
                 SELECT
@@ -81,7 +84,7 @@ def _migrate_to_products_only_schema() -> None:
                     characteristic_uz, characteristic_ru, characteristic_en,
                     NULL,
                     price_uz, price_ru, price_en,
-                    0, NULL, NULL, NULL, NULL, NULL, images
+                    0, NULL, NULL, NULL, NULL, 0, NULL, NULL, images
                 FROM products
                 """
             )
@@ -105,6 +108,14 @@ def _migrate_to_products_only_schema() -> None:
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_plans"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_plans TEXT")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "initial_payment_enabled"):
+            cursor.execute(
+                "ALTER TABLE products ADD COLUMN initial_payment_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "initial_payment_amount"):
+            cursor.execute("ALTER TABLE products ADD COLUMN initial_payment_amount INTEGER")
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "config_options"):
             cursor.execute("ALTER TABLE products ADD COLUMN config_options TEXT")

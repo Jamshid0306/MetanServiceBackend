@@ -22,6 +22,8 @@ class ProductBase(BaseModel):
     credit_months: Optional[int] = None
     credit_percent: Optional[int] = None
     credit_plans: List[CreditPlan] = Field(default_factory=list)
+    initial_payment_enabled: bool = False
+    initial_payment_amount: Optional[int] = None
     images: List[str]
 
 class ProductCreate(ProductBase):
