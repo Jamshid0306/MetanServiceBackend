@@ -696,6 +696,23 @@ def delete_order(order_id: int) -> None:
         conn.close()
 
 
+def delete_order_by_id(order_id: int) -> dict[str, Any] | None:
+    order = get_order(order_id)
+    if not order:
+        return None
+
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM monthly_payments WHERE order_id = ?", (order_id,))
+        cursor.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return order
+
+
 init_db()
 ensure_orders_schema()
 init_monthly_payments_db()

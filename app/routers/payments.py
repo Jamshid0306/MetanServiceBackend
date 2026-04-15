@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..auth import verify_admin_token
 from ..config import (
     CLICK_MERCHANT_ID,
     CLICK_MERCHANT_USER_ID,
@@ -50,6 +51,7 @@ from ..myid_ican_locations import resolve_ican_location
 from ..orders_database import (
     create_order,
     create_monthly_payment,
+    delete_order_by_id,
     get_order,
     get_monthly_payment,
     get_monthly_payments_by_order_id,
@@ -1592,6 +1594,22 @@ def get_public_order_status(order_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Order not found")
 
     return _build_public_order_payload(order)
+
+
+@router.delete("/orders/{order_id}")
+def delete_payment_order(
+    order_id: int,
+    token: dict = Depends(verify_admin_token),
+) -> dict[str, Any]:
+    deleted_order = delete_order_by_id(order_id)
+    if not deleted_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "detail": "Order deleted successfully",
+    }
 
 
 @router.post("/orders/{order_id}/monthly-payment/initiate")
