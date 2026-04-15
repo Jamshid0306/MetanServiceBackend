@@ -29,6 +29,7 @@ from ..config import (
     ICAN_CREDIT_CREATE_PATH,
     ICAN_CREDIT_EMPLOYEE_ID,
     ICAN_CREDIT_PASSWORD,
+    ICAN_CREDIT_TRANSACTION_CREATE_PATH,
     ICAN_CREDIT_USERNAME,
     MYID_BASE_URL,
     MYID_CLIENT_ID,
@@ -44,15 +45,22 @@ from ..config import (
     MYID_WEB_BASE_URL,
 )
 from ..database import get_db
+from ..customers_database import get_customer_by_id
 from ..myid_ican_locations import resolve_ican_location
 from ..orders_database import (
     create_order,
+    create_monthly_payment,
     get_order,
+    get_monthly_payment,
+    get_monthly_payments_by_order_id,
+    get_monthly_payments_by_phone,
+    get_orders_by_phone,
     get_order_by_prepare_id,
     get_order_by_myid_session_id,
     mark_order_cancelled,
     mark_order_completed,
     update_order,
+    update_monthly_payment,
 )
 
 router = APIRouter()
@@ -68,6 +76,7 @@ CLICK_ERROR_ORDER_NOT_FOUND = -5
 CLICK_ERROR_TRANSACTION_NOT_FOUND = -6
 CLICK_ERROR_REQUEST = -8
 CLICK_ERROR_CANCELLED = -9
+MONTHLY_PAYMENT_CLICK_OFFSET = 9_000_000_000
 
 MYID_CLIENT_TOKEN_CACHE: dict[str, Any] = {
     "access_token": "",
@@ -172,6 +181,12 @@ class MyIdFinalizePayload(BaseModel):
 
 class MyIdSessionClosePayload(BaseModel):
     code: int = 3
+
+
+class MonthlyPaymentInitiatePayload(BaseModel):
+    amount: float | None = None
+    phone: str | None = None
+    return_url: str | None = None
 
 
 def _normalize_phone(value: Any) -> str:
@@ -312,6 +327,53 @@ def _build_click_payment_url(order_id: int, total: float, return_url: str) -> st
         "merchant_id": CLICK_MERCHANT_ID,
         "amount": _build_click_amount(total),
         "transaction_param": order_id,
+    }
+
+    if CLICK_MERCHANT_USER_ID:
+        params["merchant_user_id"] = CLICK_MERCHANT_USER_ID
+
+    if return_url:
+        params["return_url"] = return_url
+
+    return f"{CLICK_PAYMENT_BASE_URL}?{urlencode(params)}"
+
+
+def _build_monthly_click_transaction_param(payment_id: int) -> int:
+    return MONTHLY_PAYMENT_CLICK_OFFSET + int(payment_id)
+
+
+def _parse_monthly_payment_id(value: Any) -> int | None:
+    raw = str(value or "").strip()
+    if not raw.isdigit():
+        return None
+
+    numeric = int(raw)
+    if numeric < MONTHLY_PAYMENT_CLICK_OFFSET:
+        return None
+
+    payment_id = numeric - MONTHLY_PAYMENT_CLICK_OFFSET
+    return payment_id if payment_id > 0 else None
+
+
+def _build_monthly_return_url(request: Request, explicit_url: str | None, payment_id: int) -> str:
+    if explicit_url:
+        return _append_query_params(explicit_url, {"monthly_payment_id": payment_id})
+
+    origin = str(request.headers.get("origin") or "").strip().rstrip("/")
+    if not origin:
+        referer = str(request.headers.get("referer") or "").strip()
+        if referer.startswith("http://") or referer.startswith("https://"):
+            origin = referer.split("://", 1)[0] + "://" + referer.split("://", 1)[1].split("/", 1)[0]
+
+    return _append_query_params(f"{origin}/profile/orders", {"monthly_payment_id": payment_id}) if origin else ""
+
+
+def _build_monthly_click_payment_url(payment_id: int, amount: float, return_url: str) -> str:
+    params = {
+        "service_id": CLICK_SERVICE_ID,
+        "merchant_id": CLICK_MERCHANT_ID,
+        "amount": _build_click_amount(amount),
+        "transaction_param": _build_monthly_click_transaction_param(payment_id),
     }
 
     if CLICK_MERCHANT_USER_ID:
@@ -748,6 +810,99 @@ def _submit_ican_credit_for_order(order: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(
             status_code=502,
             detail="ICAN credit service returned an invalid response",
+        )
+
+    return payload
+
+
+def _extract_ican_credit_id(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("credit_id", "creditId", "credit___id", "id"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+        for key in ("data", "result", "credit"):
+            nested_value = _extract_ican_credit_id(payload.get(key))
+            if nested_value:
+                return nested_value
+
+    if isinstance(payload, list):
+        for item in payload:
+            nested_value = _extract_ican_credit_id(item)
+            if nested_value:
+                return nested_value
+
+    return ""
+
+
+def _resolve_order_monthly_payment_amount(order: dict[str, Any]) -> float:
+    products = order.get("products") if isinstance(order.get("products"), list) else []
+    total = 0.0
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        credit_plan = product.get("credit_plan") if isinstance(product.get("credit_plan"), dict) else {}
+        quantity = _parse_positive_int(product.get("quantity")) or 1
+        total += _parse_amount(
+            credit_plan.get("monthly_payment") or credit_plan.get("monthlyPayment")
+        ) * quantity
+
+    return total
+
+
+def _submit_ican_credit_transaction(*, credit_id: str, amount: float) -> dict[str, Any]:
+    if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
+        raise HTTPException(
+            status_code=500,
+            detail="ICAN credit integration credentials are not configured",
+        )
+
+    normalized_credit_id = str(credit_id or "").strip()
+    if not normalized_credit_id:
+        raise HTTPException(status_code=400, detail="Kredit ID topilmadi.")
+
+    if float(amount or 0) <= 0:
+        raise HTTPException(status_code=400, detail="To'lov summasi noto'g'ri.")
+
+    try:
+        response = requests.post(
+            f"{ICAN_CREDIT_API_URL}{ICAN_CREDIT_TRANSACTION_CREATE_PATH}",
+            json={
+                "payment_type": "card_click",
+                "amount": float(amount),
+                "credit_id": normalized_credit_id,
+            },
+            auth=(ICAN_CREDIT_USERNAME, ICAN_CREDIT_PASSWORD),
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "ru",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ICAN credit transaction service is unavailable: {exc}",
+        ) from exc
+
+    if response.status_code >= 400:
+        detail = _extract_upstream_error_detail(response)
+        status_code = 400 if response.status_code < 500 else 502
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit transaction service returned an invalid response",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="ICAN credit transaction service returned an invalid response",
         )
 
     return payload
@@ -1318,14 +1473,10 @@ def get_myid_meta() -> dict[str, Any]:
     }
 
 
-@router.get("/orders/{order_id}")
-def get_public_order_status(order_id: int) -> dict[str, Any]:
-    order = get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    payment_method = order.get("payment_method") or "cash"
+def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
+    payment_method = str(order.get("payment_method") or "cash").strip().lower() or "cash"
     status_note = ""
+    monthly_payments = get_monthly_payments_by_order_id(int(order["id"]))
 
     if payment_method == "click":
         status_note = order.get("click_error_note") or ""
@@ -1337,11 +1488,167 @@ def get_public_order_status(order_id: int) -> dict[str, Any]:
         "status": order["status"],
         "payment_method": payment_method,
         "total": order.get("total") or 0,
+        "products": order.get("products") or [],
+        "monthly_payment_amount": _resolve_order_monthly_payment_amount(order),
+        "monthly_payments": [
+            {
+                "id": payment.get("id"),
+                "amount": payment.get("amount") or 0,
+                "status": payment.get("status") or "pending",
+                "created_at": payment.get("created_at"),
+                "updated_at": payment.get("updated_at"),
+                "ican_error_note": payment.get("ican_error_note") or "",
+            }
+            for payment in monthly_payments
+        ],
+        "can_pay_monthly": bool(order.get("ican_credit_id")),
+        "created_at": order.get("created_at"),
+        "updated_at": order.get("updated_at"),
         "click_error": order.get("click_error"),
         "click_error_note": order.get("click_error_note") or "",
         "myid_result_code": order.get("myid_result_code"),
         "myid_result_note": order.get("myid_result_note") or "",
         "status_note": status_note,
+    }
+
+
+def _build_public_monthly_payment_payload(payment: dict[str, Any]) -> dict[str, Any]:
+    status = str(payment.get("status") or "pending").strip().lower() or "pending"
+    click_paid = status == "completed"
+    ican_response = payment.get("ican_response") if isinstance(payment.get("ican_response"), dict) else None
+    ican_error_note = str(payment.get("ican_error_note") or "").strip()
+    ican_sent = click_paid and bool(ican_response) and not ican_error_note
+
+    return {
+        "id": payment.get("id"),
+        "order_id": payment.get("order_id"),
+        "amount": payment.get("amount") or 0,
+        "status": status,
+        "click_paid": click_paid,
+        "click_trans_id": payment.get("click_trans_id") or "",
+        "click_paydoc_id": payment.get("click_paydoc_id") or "",
+        "click_error": payment.get("click_error"),
+        "click_error_note": payment.get("click_error_note") or "",
+        "ican_sent": ican_sent,
+        "ican_error_note": ican_error_note,
+        "needs_ican_retry": click_paid and not ican_sent,
+        "created_at": payment.get("created_at"),
+        "updated_at": payment.get("updated_at"),
+    }
+
+
+@router.get("/orders")
+def list_public_orders(phone: str) -> dict[str, Any]:
+    normalized_phone = _normalize_phone(phone)
+    if len(normalized_phone) != 12:
+        raise HTTPException(status_code=400, detail="Valid phone number is required")
+
+    orders = [_build_public_order_payload(order) for order in get_orders_by_phone(normalized_phone)]
+    return {
+        "success": True,
+        "orders": orders,
+        "total": len(orders),
+    }
+
+
+@router.get("/monthly-payments")
+def list_public_monthly_payments(
+    phone: str | None = None,
+    customer_id: int | None = None,
+) -> dict[str, Any]:
+    resolved_phone = _normalize_phone(phone or "")
+
+    if customer_id is not None:
+        customer = get_customer_by_id(customer_id)
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        customer_phone = _normalize_phone(customer.get("phone"))
+        if resolved_phone and resolved_phone != customer_phone:
+            raise HTTPException(status_code=403, detail="Phone number does not match customer")
+        resolved_phone = customer_phone
+
+    if len(resolved_phone) != 12:
+        raise HTTPException(status_code=400, detail="Valid phone number or customer_id is required")
+
+    payments = [
+        _build_public_monthly_payment_payload(payment)
+        for payment in get_monthly_payments_by_phone(resolved_phone)
+    ]
+
+    return {
+        "success": True,
+        "phone": resolved_phone,
+        "customer_id": customer_id,
+        "transactions": payments,
+        "total": len(payments),
+    }
+
+
+@router.get("/orders/{order_id}")
+def get_public_order_status(order_id: int) -> dict[str, Any]:
+    order = get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return _build_public_order_payload(order)
+
+
+@router.post("/orders/{order_id}/monthly-payment/initiate")
+def initiate_monthly_payment(
+    order_id: int,
+    payload: MonthlyPaymentInitiatePayload,
+    request: Request,
+) -> dict[str, Any]:
+    order = get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not _click_is_configured():
+        raise HTTPException(status_code=500, detail="CLICK integration is not configured")
+
+    credit_id = str(order.get("ican_credit_id") or "").strip()
+    if not credit_id:
+        raise HTTPException(status_code=400, detail="Bu buyurtma uchun kredit ID topilmadi.")
+
+    request_phone = _normalize_phone(payload.phone or "")
+    order_phone = _normalize_phone(order.get("phone"))
+    if request_phone and request_phone != order_phone:
+        raise HTTPException(status_code=403, detail="Bu buyurtma sizga tegishli emas.")
+
+    amount = _resolve_order_monthly_payment_amount(order)
+    requested_amount = float(payload.amount or 0)
+    if requested_amount > 0 and not _amounts_match(amount, requested_amount):
+        raise HTTPException(status_code=400, detail="Oylik to'lov summasi mos kelmadi.")
+
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Oylik to'lov summasi aniqlanmadi.")
+
+    payment = create_monthly_payment(
+        order_id=int(order["id"]),
+        credit_id=credit_id,
+        phone=order_phone,
+        amount=amount,
+        status="pending",
+    )
+    merchant_prepare_id = _build_monthly_click_transaction_param(int(payment["id"]))
+    payment = update_monthly_payment(
+        int(payment["id"]),
+        merchant_prepare_id=merchant_prepare_id,
+        click_error=0,
+        click_error_note="",
+    ) or payment
+
+    return_url = _build_monthly_return_url(request, payload.return_url, int(payment["id"]))
+    payment_url = _build_monthly_click_payment_url(int(payment["id"]), amount, return_url)
+
+    return {
+        "success": True,
+        "payment_id": int(payment["id"]),
+        "order_id": int(order["id"]),
+        "amount": amount,
+        "payment_url": payment_url,
+        "return_url": return_url,
     }
 
 
@@ -1704,12 +2011,15 @@ def submit_order_credit_request(order_id: int) -> dict[str, Any]:
         raise
 
     success_note = "MyID tasdiqlandi va kredit arizasi yuborildi."
+    ican_credit_id = _extract_ican_credit_id(credit_payload)
     updated_order = update_order(
         int(order["id"]),
         status="completed",
         payment_method="myid",
         myid_result_note=success_note,
         click_error_note=success_note,
+        ican_credit_id=ican_credit_id or order.get("ican_credit_id"),
+        ican_credit_payload=credit_payload,
     ) or order
 
     return {
@@ -1754,6 +2064,154 @@ def close_myid_session(session_id: str, payload: MyIdSessionClosePayload) -> dic
     }
 
 
+def _handle_monthly_prepare(data: dict[str, Any], payment_id: int) -> dict[str, Any]:
+    payment = get_monthly_payment(payment_id)
+    if not payment:
+        return _prepare_error(data, CLICK_ERROR_ORDER_NOT_FOUND, "Monthly payment not found")
+
+    if not _amounts_match(payment.get("amount") or 0, data.get("amount") or 0):
+        return _prepare_error(
+            data,
+            CLICK_ERROR_AMOUNT,
+            "Incorrect amount",
+            merchant_prepare_id=payment.get("merchant_prepare_id"),
+        )
+
+    status = str(payment.get("status") or "").strip().lower()
+    if status == "completed":
+        return _prepare_error(
+            data,
+            CLICK_ERROR_ALREADY_PAID,
+            "Monthly payment already paid",
+            merchant_prepare_id=payment.get("merchant_prepare_id"),
+        )
+    if status == "cancelled":
+        return _prepare_error(
+            data,
+            CLICK_ERROR_CANCELLED,
+            "Monthly payment cancelled",
+            merchant_prepare_id=payment.get("merchant_prepare_id"),
+        )
+
+    merchant_prepare_id = int(
+        payment.get("merchant_prepare_id") or _build_monthly_click_transaction_param(payment_id)
+    )
+    updated = update_monthly_payment(
+        int(payment["id"]),
+        status="prepared",
+        click_trans_id=str(data.get("click_trans_id") or ""),
+        click_paydoc_id=str(data.get("click_paydoc_id") or ""),
+        merchant_prepare_id=merchant_prepare_id,
+        click_error=0,
+        click_error_note="",
+    ) or payment
+
+    return _build_prepare_response(
+        click_trans_id=str(data.get("click_trans_id") or ""),
+        merchant_trans_id=str(_build_monthly_click_transaction_param(int(updated["id"]))),
+        merchant_prepare_id=merchant_prepare_id,
+        error=0,
+        error_note="Success",
+    )
+
+
+def _handle_monthly_complete(data: dict[str, Any], payment_id: int) -> dict[str, Any]:
+    payment = get_monthly_payment(payment_id)
+    if not payment:
+        return _complete_error(data, CLICK_ERROR_ORDER_NOT_FOUND, "Monthly payment not found")
+
+    merchant_prepare_id = _parse_order_id(data.get("merchant_prepare_id"))
+    expected_prepare_id = int(
+        payment.get("merchant_prepare_id") or _build_monthly_click_transaction_param(payment_id)
+    )
+    if merchant_prepare_id != expected_prepare_id:
+        return _complete_error(data, CLICK_ERROR_TRANSACTION_NOT_FOUND, "Transaction not found")
+
+    if not _amounts_match(payment.get("amount") or 0, data.get("amount") or 0):
+        return _complete_error(
+            data,
+            CLICK_ERROR_AMOUNT,
+            "Incorrect amount",
+            merchant_confirm_id=payment.get("merchant_confirm_id"),
+        )
+
+    status = str(payment.get("status") or "").strip().lower()
+    if status == "completed":
+        return _complete_error(
+            data,
+            CLICK_ERROR_ALREADY_PAID,
+            "Monthly payment already paid",
+            merchant_confirm_id=payment.get("merchant_confirm_id"),
+        )
+    if status == "cancelled":
+        return _complete_error(
+            data,
+            CLICK_ERROR_CANCELLED,
+            "Monthly payment cancelled",
+            merchant_confirm_id=payment.get("merchant_confirm_id"),
+        )
+
+    click_error = int(str(data.get("error") or "0").strip() or "0")
+    error_note = str(data.get("error_note") or "").strip()
+    if click_error <= -1:
+        cancelled = update_monthly_payment(
+            int(payment["id"]),
+            status="cancelled",
+            click_trans_id=str(data.get("click_trans_id") or ""),
+            click_paydoc_id=str(data.get("click_paydoc_id") or ""),
+            merchant_prepare_id=merchant_prepare_id,
+            click_error=click_error,
+            click_error_note=error_note or "Payment cancelled by CLICK",
+        ) or payment
+        return _complete_error(
+            data,
+            CLICK_ERROR_CANCELLED,
+            error_note or "Payment cancelled by CLICK",
+            merchant_confirm_id=cancelled.get("merchant_confirm_id"),
+        )
+
+    merchant_confirm_id = int(payment.get("merchant_confirm_id") or expected_prepare_id)
+    completed = update_monthly_payment(
+        int(payment["id"]),
+        status="completed",
+        click_trans_id=str(data.get("click_trans_id") or ""),
+        click_paydoc_id=str(data.get("click_paydoc_id") or ""),
+        merchant_prepare_id=merchant_prepare_id,
+        merchant_confirm_id=merchant_confirm_id,
+        click_error=0,
+        click_error_note="Success",
+    ) or payment
+
+    try:
+        ican_response = _submit_ican_credit_transaction(
+            credit_id=str(completed.get("credit_id") or ""),
+            amount=float(completed.get("amount") or 0),
+        )
+        completed = update_monthly_payment(
+            int(completed["id"]),
+            ican_response=ican_response,
+            ican_error_note="",
+        ) or completed
+    except HTTPException as exc:
+        update_monthly_payment(
+            int(completed["id"]),
+            ican_error_note=str(exc.detail),
+        )
+    except Exception:
+        update_monthly_payment(
+            int(completed["id"]),
+            ican_error_note="ICAN monthly transaction request failed after CLICK payment.",
+        )
+
+    return _build_complete_response(
+        click_trans_id=str(data.get("click_trans_id") or ""),
+        merchant_trans_id=str(_build_monthly_click_transaction_param(int(completed["id"]))),
+        merchant_confirm_id=merchant_confirm_id,
+        error=0,
+        error_note="Success",
+    )
+
+
 def _handle_prepare(data: dict[str, Any]) -> dict[str, Any]:
     if not _click_is_configured():
         return _prepare_error(data, CLICK_ERROR_REQUEST, "CLICK integration is not configured")
@@ -1767,6 +2225,10 @@ def _handle_prepare(data: dict[str, Any]) -> dict[str, Any]:
 
     if not _validate_signature(data, 0):
         return _prepare_error(data, CLICK_ERROR_SIGNATURE, "Invalid signature")
+
+    monthly_payment_id = _parse_monthly_payment_id(data.get("merchant_trans_id"))
+    if monthly_payment_id:
+        return _handle_monthly_prepare(data, monthly_payment_id)
 
     order_id = _parse_order_id(data.get("merchant_trans_id"))
     if order_id is None:
@@ -1833,6 +2295,10 @@ def _handle_complete(data: dict[str, Any]) -> dict[str, Any]:
 
     if not _validate_signature(data, 1):
         return _complete_error(data, CLICK_ERROR_SIGNATURE, "Invalid signature")
+
+    monthly_payment_id = _parse_monthly_payment_id(data.get("merchant_trans_id"))
+    if monthly_payment_id:
+        return _handle_monthly_complete(data, monthly_payment_id)
 
     order_id = _parse_order_id(data.get("merchant_trans_id"))
     merchant_prepare_id = _parse_order_id(data.get("merchant_prepare_id"))
@@ -1909,11 +2375,14 @@ def _handle_complete(data: dict[str, Any]) -> dict[str, Any]:
 
     if completed.get("myid_profile"):
         try:
-            _submit_ican_credit_for_order(completed)
+            credit_payload = _submit_ican_credit_for_order(completed)
+            ican_credit_id = _extract_ican_credit_id(credit_payload)
             completed = update_order(
                 int(completed["id"]),
                 click_error_note="Boshlang'ich to'lov qabul qilindi. Kredit arizasi yuborildi.",
                 myid_result_note="Boshlang'ich to'lov qabul qilindi. Kredit arizasi yuborildi.",
+                ican_credit_id=ican_credit_id or completed.get("ican_credit_id"),
+                ican_credit_payload=credit_payload,
             ) or completed
         except HTTPException as exc:
             completed = update_order(
