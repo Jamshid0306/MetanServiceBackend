@@ -801,6 +801,9 @@ def _submit_ican_credit_for_order(order: dict[str, Any]) -> dict[str, Any]:
         or permanent_registration.get("address")
         or ""
     ).strip()
+    # Keep customer profile address in sync with the exact address sent to credit submit.
+    if passport_address:
+        update_customer_address_by_phone(order.get("phone"), passport_address)
     birth_address = str(common_data.get("birth_place") or common_data.get("birth_country") or "").strip()
 
     form_data: dict[str, Any] = {
