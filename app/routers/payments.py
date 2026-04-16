@@ -716,6 +716,22 @@ def _extract_myid_residential_address(profile: dict[str, Any]) -> str:
     return ", ".join(unique_parts)
 
 
+def _sync_customer_address_from_myid_profile(
+    order: dict[str, Any] | None,
+    profile: dict[str, Any] | None,
+) -> None:
+    if not isinstance(order, dict) or not isinstance(profile, dict):
+        return
+
+    phone = _normalize_phone(order.get("phone"))
+    if len(phone) != 12:
+        return
+
+    # Always refresh customer address from the latest MyID profile payload.
+    address = _extract_myid_residential_address(profile)
+    update_customer_address_by_phone(phone, address)
+
+
 def _build_credit_phone_list(order_phone: Any, profile: dict[str, Any]) -> list[str]:
     _, _, contacts, _, _ = _resolve_myid_profile_sections(profile)
     values = [
@@ -1886,6 +1902,10 @@ def finalize_myid_payment(
             order = update_order(int(order["id"]), **update_fields) or order
 
     if order and order.get("myid_profile") and str(order.get("myid_result_code") or "").strip() == "1":
+        _sync_customer_address_from_myid_profile(
+            order,
+            order.get("myid_profile") if isinstance(order.get("myid_profile"), dict) else {},
+        )
         return _build_existing_myid_finalize_response(order, request, session_id=session_id)
 
     if payload.reason_code is not None and not str(payload.auth_code or "").strip():
@@ -1935,10 +1955,7 @@ def finalize_myid_payment(
         raise exc
     access_token = str(token_payload.get("access_token") or "").strip()
     profile = _myid_fetch_user_profile(access_token)
-    if order:
-        residential_address = _extract_myid_residential_address(profile)
-        if residential_address:
-            update_customer_address_by_phone(order.get("phone"), residential_address)
+    _sync_customer_address_from_myid_profile(order, profile)
     job_id = str(_decode_jwt_payload(access_token).get("job_id") or "").strip()
     result_note = "MyID verification completed successfully"
 
