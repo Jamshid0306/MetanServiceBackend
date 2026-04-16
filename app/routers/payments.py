@@ -2106,10 +2106,18 @@ def submit_order_credit_request(
             "result_note": str(order.get("myid_result_note") or order.get("click_error_note") or "").strip(),
         }
 
+    extra_phones = [
+        phone
+        for phone in {_normalize_phone(phone) for phone in ((payload.phones if payload else []) or [])}
+        if len(phone) == 12
+    ]
+    if len(extra_phones) < 3:
+        raise HTTPException(status_code=400, detail="3 ta qo'shimcha telefon raqami majburiy.")
+
     try:
         credit_payload = _submit_ican_credit_for_order(
             order,
-            extra_phones=(payload.phones if payload else []),
+            extra_phones=extra_phones,
         )
     except HTTPException as exc:
         update_order(

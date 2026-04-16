@@ -232,7 +232,7 @@ def get_customer_record_by_phone(phone: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE phone = ?
         """,
@@ -256,7 +256,7 @@ def get_customer_record_by_id(customer_id: int | str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -276,7 +276,7 @@ def get_all_customers():
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         ORDER BY created_at DESC, id DESC
         """
@@ -325,7 +325,7 @@ def update_customer_telegram_by_phone(
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -370,7 +370,7 @@ def get_customer_record_by_telegram_username(telegram_username: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE lower(telegram_username) = ?
         """,
@@ -390,7 +390,7 @@ def get_customer_record_by_telegram_id(telegram_id: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE telegram_id = ?
         """,
@@ -478,7 +478,7 @@ def save_customer_account(
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -840,7 +840,7 @@ def update_customer_password_by_phone(phone: str, password: str):
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -967,7 +967,7 @@ def save_or_update_customer_from_telegram(
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
