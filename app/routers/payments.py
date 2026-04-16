@@ -12,7 +12,7 @@ from uuid import uuid4
 from urllib.parse import urlencode
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -193,6 +193,10 @@ class MonthlyPaymentInitiatePayload(BaseModel):
     amount: float | None = None
     phone: str | None = None
     return_url: str | None = None
+
+
+class SubmitCreditPayload(BaseModel):
+    phones: list[str] = Field(default_factory=list)
 
 
 def _normalize_phone(value: Any) -> str:
@@ -683,25 +687,28 @@ def _resolve_myid_ican_location(profile: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_myid_residential_address(profile: dict[str, Any]) -> str:
     _, _, _, address, permanent_registration = _resolve_myid_profile_sections(profile)
-    parts = [
-        str(
-            permanent_registration.get("address")
-            or address.get("permanent_address")
-            or ""
-        ).strip(),
-        str(
-            permanent_registration.get("district")
-            or permanent_registration.get("district_name")
-            or address.get("district")
-            or ""
-        ).strip(),
-        str(
-            permanent_registration.get("region")
-            or permanent_registration.get("region_name")
-            or address.get("region")
-            or ""
-        ).strip(),
-    ]
+    raw_address = (
+        permanent_registration.get("address")
+        or address.get("permanent_address")
+        or address.get("address")
+        or address.get("current_address")
+        or ""
+    )
+    district = (
+        permanent_registration.get("district")
+        or permanent_registration.get("district_name")
+        or address.get("district")
+        or address.get("district_name")
+        or ""
+    )
+    region = (
+        permanent_registration.get("region")
+        or permanent_registration.get("region_name")
+        or address.get("region")
+        or address.get("region_name")
+        or ""
+    )
+    parts = [str(raw_address).strip(), str(district).strip(), str(region).strip()]
     unique_parts: list[str] = []
     seen: set[str] = set()
     for part in parts:
@@ -729,14 +736,21 @@ def _sync_customer_address_from_myid_profile(
 
     # Always refresh customer address from the latest MyID profile payload.
     address = _extract_myid_residential_address(profile)
+    if not address:
+        return
     update_customer_address_by_phone(phone, address)
 
 
-def _build_credit_phone_list(order_phone: Any, profile: dict[str, Any]) -> list[str]:
+def _build_credit_phone_list(
+    order_phone: Any,
+    profile: dict[str, Any],
+    extra_phones: list[str] | None = None,
+) -> list[str]:
     _, _, contacts, _, _ = _resolve_myid_profile_sections(profile)
     values = [
         _normalize_phone(order_phone),
         _normalize_phone(contacts.get("phone")),
+        *[_normalize_phone(phone) for phone in (extra_phones or [])],
     ]
     seen: set[str] = set()
     result: list[str] = []
@@ -745,10 +759,13 @@ def _build_credit_phone_list(order_phone: Any, profile: dict[str, Any]) -> list[
             continue
         seen.add(value)
         result.append(value)
-    return result
+    return result[:3]
 
 
-def _submit_ican_credit_for_order(order: dict[str, Any]) -> dict[str, Any]:
+def _submit_ican_credit_for_order(
+    order: dict[str, Any],
+    extra_phones: list[str] | None = None,
+) -> dict[str, Any]:
     if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
         raise HTTPException(
             status_code=500,
@@ -771,7 +788,7 @@ def _submit_ican_credit_for_order(order: dict[str, Any]) -> dict[str, Any]:
     region_id = int(location["ican_region_id"])
     district_id = int(location["ican_district_id"])
 
-    phones = _build_credit_phone_list(order.get("phone"), profile)
+    phones = _build_credit_phone_list(order.get("phone"), profile, extra_phones=extra_phones)
     if not phones:
         raise HTTPException(status_code=400, detail="Telefon raqami topilmadi.")
 
@@ -799,15 +816,11 @@ def _submit_ican_credit_for_order(order: dict[str, Any]) -> dict[str, Any]:
     passport_address = str(
         address.get("permanent_address")
         or permanent_registration.get("address")
+        or address.get("address")
+        or address.get("current_address")
         or ""
     ).strip()
-    # Keep customer profile address in sync with credit submit payload (100% persistent fallback).
-    address_parts = []
-    if passport_address:
-        address_parts.append(passport_address)
-    address_parts.append(f"region_id={region_id}")
-    address_parts.append(f"district_id={district_id}")
-    update_customer_address_by_phone(order.get("phone"), ", ".join(address_parts))
+    _sync_customer_address_from_myid_profile(order, profile)
     birth_address = str(common_data.get("birth_place") or common_data.get("birth_country") or "").strip()
 
     form_data: dict[str, Any] = {
@@ -2067,7 +2080,10 @@ def finalize_myid_payment(
 
 
 @router.post("/orders/{order_id}/submit-credit")
-def submit_order_credit_request(order_id: int) -> dict[str, Any]:
+def submit_order_credit_request(
+    order_id: int,
+    payload: SubmitCreditPayload | None = Body(default=None),
+) -> dict[str, Any]:
     order = get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -2091,7 +2107,10 @@ def submit_order_credit_request(order_id: int) -> dict[str, Any]:
         }
 
     try:
-        credit_payload = _submit_ican_credit_for_order(order)
+        credit_payload = _submit_ican_credit_for_order(
+            order,
+            extra_phones=(payload.phones if payload else []),
+        )
     except HTTPException as exc:
         update_order(
             int(order["id"]),
