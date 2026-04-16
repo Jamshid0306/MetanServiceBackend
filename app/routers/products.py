@@ -1164,6 +1164,29 @@ def dump_config_options(raw_options: Optional[Any]) -> Optional[str]:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def get_minimum_cylinder_price(raw_options: Optional[Any]) -> Optional[int]:
+    config = normalize_config_options(raw_options)
+    minimum_price: Optional[int] = None
+
+    for fuel_type in config.get("fuel_types", []):
+        transmissions = fuel_type.get("transmissions") or []
+        for transmission in transmissions:
+            cylinder_volumes = transmission.get("cylinder_volumes") or []
+            for cylinder_volume in cylinder_volumes:
+                price = parse_numeric_price(cylinder_volume.get("price_delta"))
+                if price is None or price <= 0:
+                    continue
+
+                numeric_price = int(price)
+                minimum_price = (
+                    numeric_price
+                    if minimum_price is None
+                    else min(minimum_price, numeric_price)
+                )
+
+    return minimum_price
+
+
 class CreditOrderPayload(BaseModel):
     tariff_id: int
     amount: float
@@ -1196,16 +1219,18 @@ class OrderPayload(BaseModel):
 def serialize_product(product: models.Product, include_full_details: bool = True) -> dict[str, Any]:
     credit_plans = load_credit_plans(product)
     credit_months, credit_percent = resolve_credit_fields(product)
+    minimum_cylinder_price = get_minimum_cylinder_price(product.config_options)
+    public_price = minimum_cylinder_price if minimum_cylinder_price is not None else None
     payload: dict[str, Any] = {
         "id": product.id,
         "order": getattr(product, "order", 999999),
         "name_uz": product.name_uz,
         "name_ru": product.name_ru,
         "name_en": product.name_en,
-        "default_price": product.default_price,
-        "price_uz": product.price_uz,
-        "price_ru": product.price_ru,
-        "price_en": product.price_en,
+        "default_price": None,
+        "price_uz": public_price if public_price is not None else product.price_uz,
+        "price_ru": public_price if public_price is not None else product.price_ru,
+        "price_en": public_price if public_price is not None else product.price_en,
         "credit_enabled": bool(product.credit_enabled),
         "credit_months": credit_months,
         "credit_percent": credit_percent,

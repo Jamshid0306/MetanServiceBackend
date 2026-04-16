@@ -46,7 +46,11 @@ from ..config import (
     MYID_WEB_BASE_URL,
 )
 from ..database import get_db
-from ..customers_database import get_customer_by_id
+from ..customers_database import (
+    get_customer_by_id,
+    get_customer_by_phone,
+    update_customer_address_by_phone,
+)
 from ..myid_ican_locations import resolve_ican_location
 from ..orders_database import (
     create_order,
@@ -675,6 +679,41 @@ def _resolve_myid_ican_location(profile: dict[str, Any]) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _extract_myid_residential_address(profile: dict[str, Any]) -> str:
+    _, _, _, address, permanent_registration = _resolve_myid_profile_sections(profile)
+    parts = [
+        str(
+            permanent_registration.get("address")
+            or address.get("permanent_address")
+            or ""
+        ).strip(),
+        str(
+            permanent_registration.get("district")
+            or permanent_registration.get("district_name")
+            or address.get("district")
+            or ""
+        ).strip(),
+        str(
+            permanent_registration.get("region")
+            or permanent_registration.get("region_name")
+            or address.get("region")
+            or ""
+        ).strip(),
+    ]
+    unique_parts: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        normalized = part.strip()
+        if not normalized:
+            continue
+        dedupe_key = normalized.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        unique_parts.append(normalized)
+    return ", ".join(unique_parts)
 
 
 def _build_credit_phone_list(order_phone: Any, profile: dict[str, Any]) -> list[str]:
@@ -1485,10 +1524,14 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
     elif payment_method == "myid":
         status_note = order.get("myid_result_note") or ""
 
+    customer = get_customer_by_phone(_normalize_phone(order.get("phone")))
+    customer_address = str((customer or {}).get("address") or "").strip()
+
     return {
         "id": order["id"],
         "status": order["status"],
         "payment_method": payment_method,
+        "customer_address": customer_address,
         "total": order.get("total") or 0,
         "products": order.get("products") or [],
         "monthly_payment_amount": _resolve_order_monthly_payment_amount(order),
@@ -1892,6 +1935,10 @@ def finalize_myid_payment(
         raise exc
     access_token = str(token_payload.get("access_token") or "").strip()
     profile = _myid_fetch_user_profile(access_token)
+    if order:
+        residential_address = _extract_myid_residential_address(profile)
+        if residential_address:
+            update_customer_address_by_phone(order.get("phone"), residential_address)
     job_id = str(_decode_jwt_payload(access_token).get("job_id") or "").strip()
     result_note = "MyID verification completed successfully"
 

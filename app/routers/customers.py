@@ -204,6 +204,7 @@ class CustomerResponse(BaseModel):
     id: int | None = None
     name: str
     phone: str
+    address: str | None = None
     telegram_id: str | None = None
     telegram_username: str | None = None
     created_at: str | None = None

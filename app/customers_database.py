@@ -30,6 +30,7 @@ def init_customers_db():
             phone TEXT NOT NULL UNIQUE,
             telegram_id TEXT UNIQUE,
             telegram_username TEXT UNIQUE,
+            address TEXT,
             password_hash TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -57,6 +58,9 @@ def ensure_customer_columns():
 
     if "telegram_id" not in existing_columns:
         cursor.execute("ALTER TABLE customers ADD COLUMN telegram_id TEXT")
+
+    if "address" not in existing_columns:
+        cursor.execute("ALTER TABLE customers ADD COLUMN address TEXT")
 
     conn.commit()
     conn.close()
@@ -185,6 +189,7 @@ def serialize_customer(record):
         "phone": public_phone,
         "telegram_id": record["telegram_id"],
         "telegram_username": record["telegram_username"],
+        "address": str(record["address"] or "").strip() if "address" in record.keys() else "",
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
     }
@@ -836,6 +841,38 @@ def update_customer_password_by_phone(phone: str, password: str):
     cursor.execute(
         """
         SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, created_at, updated_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (existing_record["id"],),
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return serialize_customer(record)
+
+
+def update_customer_address_by_phone(phone: str, address: str):
+    normalized_phone = str(phone or "").strip()
+    existing_record = get_customer_record_by_phone(normalized_phone)
+    if not existing_record:
+        return None
+
+    normalized_address = str(address or "").strip()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE customers
+        SET address = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (normalized_address or None, existing_record["id"]),
+    )
+    conn.commit()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
