@@ -3,14 +3,16 @@ import hmac
 import logging
 import secrets
 import time
+from datetime import datetime, timedelta
 from typing import Any
 
+import jwt  # type: ignore
 import requests  # type: ignore
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
-from ..auth import verify_token
-from ..config import TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
+from ..auth import verify_admin_token, verify_token
+from ..config import SECRET_KEY, TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
 from ..customers_database import (
     authenticate_customer,
     complete_customer_registration_session,
@@ -18,6 +20,7 @@ from ..customers_database import (
     delete_customer_by_id,
     get_all_customers,
     get_customer_by_id,
+    get_customer_favorites,
     get_customer_by_phone,
     get_customer_login_session,
     get_customer_record_by_phone,
@@ -35,6 +38,7 @@ from ..customers_database import (
     save_or_update_customer_from_telegram,
     save_customer_account,
     update_customer_telegram_by_phone,
+    update_customer_favorites,
     update_customer_password_by_phone,
 )
 
@@ -47,6 +51,8 @@ TELEGRAM_BOT_API_BASE_URL = (
 )
 TELEGRAM_REGISTRATION_DEEP_LINK_PREFIX = "register_"
 TELEGRAM_LOGIN_DEEP_LINK_PREFIX = "login_"
+JWT_ALGORITHM = "HS256"
+CUSTOMER_ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 
 def normalize_phone_number(value: Any) -> str:
@@ -205,6 +211,7 @@ class CustomerResponse(BaseModel):
     name: str
     phone: str
     address: str | None = None
+    favorites: list[int] = []
     telegram_id: str | None = None
     telegram_username: str | None = None
     created_at: str | None = None
@@ -241,6 +248,8 @@ class CustomerTelegramRegistrationStatusResponse(BaseModel):
     bot_url: str | None = None
     error: str | None = None
     customer: CustomerResponse | None = None
+    access_token: str | None = None
+    token_type: str | None = None
 
 
 class CustomerTelegramLoginStatusResponse(BaseModel):
@@ -250,12 +259,24 @@ class CustomerTelegramLoginStatusResponse(BaseModel):
     bot_url: str | None = None
     error: str | None = None
     customer: CustomerResponse | None = None
+    access_token: str | None = None
+    token_type: str | None = None
 
 
 class CustomerResetPasswordPayload(BaseModel):
     phone: str
     password: str
     reset_token: str | None = None
+
+
+class CustomerFavoritePayload(BaseModel):
+    product_id: int
+
+
+class CustomerFavoritesResponse(BaseModel):
+    success: bool
+    favorites: list[int]
+    customer: CustomerResponse | None = None
 
 
 class TelegramBotWebhookInfoResponse(BaseModel):
@@ -334,6 +355,43 @@ def validate_telegram_login(payload: CustomerTelegramLoginPayload) -> None:
         )
 
 
+def create_customer_access_token(customer: dict[str, Any]) -> str:
+    customer_id = str(customer.get("id") or "").strip()
+    if not customer_id:
+        raise HTTPException(status_code=500, detail="Customer id is missing")
+
+    expires_at = datetime.utcnow() + timedelta(days=CUSTOMER_ACCESS_TOKEN_EXPIRE_DAYS)
+    payload = {
+        "sub": customer_id,
+        "customer_id": customer_id,
+        "phone": str(customer.get("phone") or "").strip(),
+        "type": "customer",
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def build_customer_auth_response(customer: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "success": True,
+        "customer": customer,
+        "access_token": create_customer_access_token(customer),
+        "token_type": "bearer",
+    }
+
+
+def get_authenticated_customer(token: dict = Depends(verify_token)) -> dict[str, Any]:
+    if str(token.get("type") or "").strip().lower() != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required")
+
+    customer_id = str(token.get("customer_id") or token.get("sub") or "").strip()
+    customer = get_customer_by_id(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer profile was not found")
+
+    return customer
+
+
 @router.get("/telegram-login/config", include_in_schema=False)
 def get_telegram_login_config():
     return {
@@ -356,7 +414,7 @@ def get_telegram_registration_config():
     summary="Get Telegram bot webhook info",
     description="Returns the webhook status reported by Telegram Bot API. Requires an admin bearer token.",
 )
-def get_telegram_bot_webhook_info(token: dict = Depends(verify_token)):
+def get_telegram_bot_webhook_info(token: dict = Depends(verify_admin_token)):
     if not is_telegram_registration_configured():
         raise HTTPException(
             status_code=503,
@@ -394,7 +452,7 @@ def get_telegram_bot_webhook_info(token: dict = Depends(verify_token)):
 )
 def set_telegram_bot_webhook(
     payload: TelegramBotWebhookSetPayload,
-    token: dict = Depends(verify_token),
+    token: dict = Depends(verify_admin_token),
 ):
     if not is_telegram_registration_configured():
         raise HTTPException(
@@ -431,12 +489,69 @@ def set_telegram_bot_webhook(
     summary="Get all customers",
     description="Returns the full customer list. Requires an admin bearer token.",
 )
-def list_all_customers(token: dict = Depends(verify_token)):
+def list_all_customers(token: dict = Depends(verify_admin_token)):
     customers = get_all_customers()
     return {
         "success": True,
         "customers": customers,
         "total": len(customers),
+    }
+
+
+@router.get("/me", response_model=CustomerResponse)
+def get_current_customer(customer: dict[str, Any] = Depends(get_authenticated_customer)):
+    return customer
+
+
+@router.get("/me/favorites", response_model=CustomerFavoritesResponse)
+def get_current_customer_favorites(customer: dict[str, Any] = Depends(get_authenticated_customer)):
+    return {
+        "success": True,
+        "favorites": get_customer_favorites(customer["id"]),
+        "customer": customer,
+    }
+
+
+@router.post("/me/favorites", response_model=CustomerFavoritesResponse)
+def add_current_customer_favorite(
+    payload: CustomerFavoritePayload,
+    customer: dict[str, Any] = Depends(get_authenticated_customer),
+):
+    product_id = int(payload.product_id or 0)
+    if product_id <= 0:
+        raise HTTPException(status_code=400, detail="Product id is required")
+
+    favorites = get_customer_favorites(customer["id"])
+    if product_id not in favorites:
+        favorites.append(product_id)
+
+    updated_customer = update_customer_favorites(customer["id"], favorites)
+    return {
+        "success": True,
+        "favorites": updated_customer.get("favorites", favorites) if updated_customer else favorites,
+        "customer": updated_customer,
+    }
+
+
+@router.delete("/me/favorites/{product_id}", response_model=CustomerFavoritesResponse)
+def remove_current_customer_favorite(
+    product_id: int,
+    customer: dict[str, Any] = Depends(get_authenticated_customer),
+):
+    normalized_product_id = int(product_id or 0)
+    if normalized_product_id <= 0:
+        raise HTTPException(status_code=400, detail="Product id is required")
+
+    favorites = [
+        favorite_id
+        for favorite_id in get_customer_favorites(customer["id"])
+        if favorite_id != normalized_product_id
+    ]
+    updated_customer = update_customer_favorites(customer["id"], favorites)
+    return {
+        "success": True,
+        "favorites": updated_customer.get("favorites", favorites) if updated_customer else favorites,
+        "customer": updated_customer,
     }
 
 
@@ -446,7 +561,7 @@ def list_all_customers(token: dict = Depends(verify_token)):
     summary="Delete customer by ID",
     description="Deletes a customer by ID. Requires an admin bearer token.",
 )
-def delete_customer(customer_id: int, token: dict = Depends(verify_token)):
+def delete_customer(customer_id: int, token: dict = Depends(verify_admin_token)):
     customer = delete_customer_by_id(customer_id)
     if not customer:
         raise HTTPException(
@@ -473,10 +588,7 @@ def login_customer(payload: CustomerLoginPayload):
             detail="Phone number, username or password is incorrect",
         )
 
-    return {
-        "success": True,
-        "customer": customer,
-    }
+    return build_customer_auth_response(customer)
 
 
 @router.post("/telegram-login")
@@ -524,6 +636,14 @@ def get_customer_login_status(state: str):
         )
 
     customer = get_customer_by_id(login_session["customer_id"])
+    auth_fields = (
+        {
+            "access_token": create_customer_access_token(customer),
+            "token_type": "bearer",
+        }
+        if customer and str(login_session["status"] or "").strip() == "completed"
+        else {}
+    )
     return {
         "success": True,
         "state": str(login_session["state"] or "").strip(),
@@ -531,6 +651,7 @@ def get_customer_login_status(state: str):
         "bot_url": build_telegram_login_deep_link(state),
         "error": str(login_session["last_error"] or "").strip() or None,
         "customer": customer,
+        **auth_fields,
     }
 
 
@@ -586,6 +707,14 @@ def get_customer_registration_status(state: str):
         )
 
     customer = get_customer_by_id(registration_session["customer_id"])
+    auth_fields = (
+        {
+            "access_token": create_customer_access_token(customer),
+            "token_type": "bearer",
+        }
+        if customer and str(registration_session["status"] or "").strip() == "completed"
+        else {}
+    )
     return {
         "success": True,
         "state": str(registration_session["state"] or "").strip(),
@@ -593,6 +722,7 @@ def get_customer_registration_status(state: str):
         "bot_url": build_telegram_registration_deep_link(state),
         "error": str(registration_session["last_error"] or "").strip() or None,
         "customer": customer,
+        **auth_fields,
     }
 
 
@@ -856,4 +986,3 @@ def get_telegram_bot_login_config():
         "enabled": is_telegram_registration_configured(),
         "bot_username": TELEGRAM_LOGIN_BOT_USERNAME or None,
     }
-

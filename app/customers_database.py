@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import sqlite3
 import time
@@ -31,6 +32,7 @@ def init_customers_db():
             telegram_id TEXT UNIQUE,
             telegram_username TEXT UNIQUE,
             address TEXT,
+            favorites TEXT DEFAULT '[]',
             password_hash TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -61,6 +63,9 @@ def ensure_customer_columns():
 
     if "address" not in existing_columns:
         cursor.execute("ALTER TABLE customers ADD COLUMN address TEXT")
+
+    if "favorites" not in existing_columns:
+        cursor.execute("ALTER TABLE customers ADD COLUMN favorites TEXT DEFAULT '[]'")
 
     conn.commit()
     conn.close()
@@ -183,6 +188,19 @@ def serialize_customer(record):
     phone = str(record["phone"] or "")
     public_phone = phone if phone.isdigit() else ""
 
+    favorites = []
+    if "favorites" in record.keys():
+        try:
+            parsed_favorites = json.loads(record["favorites"] or "[]")
+            if isinstance(parsed_favorites, list):
+                favorites = [
+                    int(item)
+                    for item in parsed_favorites
+                    if str(item).strip().isdigit() and int(item) > 0
+                ]
+        except (TypeError, ValueError):
+            favorites = []
+
     return {
         "id": record["id"],
         "name": build_customer_name(record),
@@ -190,6 +208,7 @@ def serialize_customer(record):
         "telegram_id": record["telegram_id"],
         "telegram_username": record["telegram_username"],
         "address": str(record["address"] or "").strip() if "address" in record.keys() else "",
+        "favorites": favorites,
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
     }
@@ -232,7 +251,7 @@ def get_customer_record_by_phone(phone: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE phone = ?
         """,
@@ -256,7 +275,7 @@ def get_customer_record_by_id(customer_id: int | str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -271,12 +290,74 @@ def get_customer_by_id(customer_id: int | str):
     return serialize_customer(get_customer_record_by_id(customer_id))
 
 
+def normalize_favorite_product_ids(values) -> list[int]:
+    if not isinstance(values, list):
+        return []
+
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            product_id = int(value)
+        except (TypeError, ValueError):
+            continue
+
+        if product_id <= 0 or product_id in seen:
+            continue
+
+        seen.add(product_id)
+        normalized.append(product_id)
+
+    return normalized
+
+
+def get_customer_favorites(customer_id: int | str) -> list[int]:
+    record = get_customer_record_by_id(customer_id)
+    if not record:
+        return []
+
+    try:
+        return normalize_favorite_product_ids(json.loads(record["favorites"] or "[]"))
+    except (TypeError, ValueError):
+        return []
+
+
+def update_customer_favorites(customer_id: int | str, favorites: list[int]):
+    record = get_customer_record_by_id(customer_id)
+    if not record:
+        return None
+
+    normalized_favorites = normalize_favorite_product_ids(favorites)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE customers
+        SET favorites = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (json.dumps(normalized_favorites), record["id"]),
+    )
+    conn.commit()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (record["id"],),
+    )
+    updated_record = cursor.fetchone()
+    conn.close()
+    return serialize_customer(updated_record)
+
+
 def get_all_customers():
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         ORDER BY created_at DESC, id DESC
         """
@@ -325,7 +406,7 @@ def update_customer_telegram_by_phone(
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -370,7 +451,7 @@ def get_customer_record_by_telegram_username(telegram_username: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE lower(telegram_username) = ?
         """,
@@ -390,7 +471,7 @@ def get_customer_record_by_telegram_id(telegram_id: str):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE telegram_id = ?
         """,
@@ -478,7 +559,7 @@ def save_customer_account(
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -840,7 +921,7 @@ def update_customer_password_by_phone(phone: str, password: str):
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -872,7 +953,7 @@ def update_customer_address_by_phone(phone: str, address: str):
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
@@ -967,7 +1048,7 @@ def save_or_update_customer_from_telegram(
     conn.commit()
     cursor.execute(
         """
-        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, created_at, updated_at
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
         FROM customers
         WHERE id = ?
         """,
