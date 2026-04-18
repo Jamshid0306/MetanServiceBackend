@@ -749,8 +749,8 @@ def _build_credit_phone_list(
     _, _, contacts, _, _ = _resolve_myid_profile_sections(profile)
     values = [
         _normalize_phone(order_phone),
-        _normalize_phone(contacts.get("phone")),
         *[_normalize_phone(phone) for phone in (extra_phones or [])],
+        _normalize_phone(contacts.get("phone")),
     ]
     seen: set[str] = set()
     result: list[str] = []
@@ -2111,8 +2111,8 @@ def submit_order_credit_request(
         for phone in {_normalize_phone(phone) for phone in ((payload.phones if payload else []) or [])}
         if len(phone) == 12
     ]
-    if len(extra_phones) < 3:
-        raise HTTPException(status_code=400, detail="3 ta qo'shimcha telefon raqami majburiy.")
+    if len(extra_phones) < 2:
+        raise HTTPException(status_code=400, detail="2 ta qo'shimcha telefon raqami majburiy.")
 
     try:
         credit_payload = _submit_ican_credit_for_order(
