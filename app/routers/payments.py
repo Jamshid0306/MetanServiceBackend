@@ -1583,6 +1583,7 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
             for payment in monthly_payments
         ],
         "can_pay_monthly": bool(order.get("ican_credit_id")),
+        "credit_submitted": bool(order.get("ican_credit_id") or order.get("ican_credit_payload")),
         "created_at": order.get("created_at"),
         "updated_at": order.get("updated_at"),
         "click_error": order.get("click_error"),
@@ -1591,6 +1592,23 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
         "myid_result_note": order.get("myid_result_note") or "",
         "status_note": status_note,
     }
+
+
+def _is_public_order_visible(order: dict[str, Any]) -> bool:
+    payment_method = str(order.get("payment_method") or "").strip().lower()
+    status = str(order.get("status") or "").strip().lower()
+    credit_submitted = bool(order.get("ican_credit_id") or order.get("ican_credit_payload"))
+
+    if credit_submitted:
+        return True
+
+    if payment_method == "click":
+        return status == "completed" and not order.get("myid_profile")
+
+    if payment_method == "myid":
+        return False
+
+    return status == "completed"
 
 
 def _build_public_monthly_payment_payload(payment: dict[str, Any]) -> dict[str, Any]:
@@ -1624,7 +1642,11 @@ def list_public_orders(phone: str) -> dict[str, Any]:
     if len(normalized_phone) != 12:
         raise HTTPException(status_code=400, detail="Valid phone number is required")
 
-    orders = [_build_public_order_payload(order) for order in get_orders_by_phone(normalized_phone)]
+    orders = [
+        _build_public_order_payload(order)
+        for order in get_orders_by_phone(normalized_phone)
+        if _is_public_order_visible(order)
+    ]
     return {
         "success": True,
         "orders": orders,
@@ -2097,13 +2119,17 @@ def submit_order_credit_request(
         if payment_method == "click" and status != "completed":
             raise HTTPException(status_code=400, detail="Avval boshlang'ich to'lovni yakunlang.")
 
-    if str(order.get("status") or "").strip().lower() == "completed":
+    if (
+        str(order.get("status") or "").strip().lower() == "completed"
+        and (order.get("ican_credit_id") or order.get("ican_credit_payload"))
+    ):
         return {
             "success": True,
             "status": "completed",
             "payment_method": str(order.get("payment_method") or "myid").strip().lower() or "myid",
             "order_id": int(order["id"]),
             "result_note": str(order.get("myid_result_note") or order.get("click_error_note") or "").strip(),
+            "credit_submitted": True,
         }
 
     extra_phones = [
@@ -2144,6 +2170,7 @@ def submit_order_credit_request(
         "payment_method": str(updated_order.get("payment_method") or "myid").strip().lower() or "myid",
         "order_id": int(updated_order["id"]),
         "result_note": success_note,
+        "credit_submitted": True,
         "credit": credit_payload,
     }
 
@@ -2489,34 +2516,12 @@ def _handle_complete(data: dict[str, Any]) -> dict[str, Any]:
         click_error_note="Success",
     ) or completed
 
-    if completed.get("myid_profile"):
-        try:
-            credit_payload = _submit_ican_credit_for_order(completed)
-            ican_credit_id = _extract_ican_credit_id(credit_payload)
-            completed = update_order(
-                int(completed["id"]),
-                click_error_note="Boshlang'ich to'lov qabul qilindi. Kredit arizasi yuborildi.",
-                myid_result_note="Boshlang'ich to'lov qabul qilindi. Kredit arizasi yuborildi.",
-                ican_credit_id=ican_credit_id or completed.get("ican_credit_id"),
-                ican_credit_payload=credit_payload,
-            ) or completed
-        except HTTPException as exc:
-            completed = update_order(
-                int(completed["id"]),
-                click_error_note=(
-                    "Boshlang'ich to'lov qabul qilindi, lekin kredit arizasini yuborib bo'lmadi. "
-                    f"{exc.detail}"
-                ),
-                myid_result_note=str(exc.detail),
-            ) or completed
-        except Exception:
-            completed = update_order(
-                int(completed["id"]),
-                click_error_note=(
-                    "Boshlang'ich to'lov qabul qilindi, lekin kredit arizasini yuborib bo'lmadi."
-                ),
-                myid_result_note="ICAN credit request failed after CLICK payment.",
-            ) or completed
+    if completed.get("myid_profile") and not completed.get("ican_credit_id"):
+        completed = update_order(
+            int(completed["id"]),
+            click_error_note="Boshlang'ich to'lov qabul qilindi. Endi qo'shimcha telefonlarni kiriting.",
+            myid_result_note="Boshlang'ich to'lov qabul qilindi. Endi qo'shimcha telefonlarni kiriting.",
+        ) or completed
 
     return _build_complete_response(
         click_trans_id=str(data.get("click_trans_id") or ""),
