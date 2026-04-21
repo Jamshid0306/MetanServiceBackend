@@ -361,7 +361,7 @@ def _fetch_ican_credit_details(order: dict[str, Any]) -> dict[str, Any]:
                 "Accept": "application/json",
                 "Accept-Language": "ru",
             },
-            timeout=20,
+            timeout=8,
         )
         response.raise_for_status()
     except requests.RequestException:
