@@ -262,11 +262,6 @@ def _extract_upstream_error_detail(response: requests.Response) -> str:
         payload = None
 
     if isinstance(payload, dict):
-        for key in ("detail", "message", "error", "error_description"):
-            value = str(payload.get(key) or "").strip()
-            if value:
-                return value
-
         errors = payload.get("errors")
         if isinstance(errors, list):
             rendered = [str(item).strip() for item in errors if str(item).strip()]
@@ -287,6 +282,11 @@ def _extract_upstream_error_detail(response: requests.Response) -> str:
                         rendered.append(f"{field}: {value}")
             if rendered:
                 return "; ".join(rendered)
+
+        for key in ("detail", "message", "error", "error_description"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
 
     text = response.text.strip()
     return text[:500] if text else "Upstream request failed."
@@ -956,26 +956,10 @@ def _submit_ican_credit_for_order(
     if not phones:
         raise HTTPException(status_code=400, detail="Telefon raqami topilmadi.")
 
-    gender = _normalize_ican_gender(common_data.get("gender"))
-    if gender not in {"male", "female"}:
-        raise HTTPException(status_code=400, detail="Jins ma'lumoti noto'g'ri.")
-
-    birth_date = _parse_myid_date(common_data.get("birth_date"))
-    passport_issue_date = _parse_myid_date(doc_data.get("issued_date"))
-    passport_expiry_date = _parse_myid_date(doc_data.get("expiry_date"))
-    if not birth_date or not passport_issue_date or not passport_expiry_date:
-        raise HTTPException(status_code=400, detail="MyID sana ma'lumotlari to'liq emas.")
-
     passport = _normalize_pass_data(doc_data.get("pass_data"))
     pinfl = "".join(ch for ch in str(common_data.get("pinfl") or "") if ch.isdigit())
     if not passport or len(pinfl) != 14:
         raise HTTPException(status_code=400, detail="Passport yoki PINFL topilmadi.")
-
-    last_name = _normalize_ican_person_name(common_data.get("last_name"))
-    first_name = _normalize_ican_person_name(common_data.get("first_name"))
-    middle_name = _normalize_ican_person_name(common_data.get("middle_name"))
-    if not last_name or not first_name:
-        raise HTTPException(status_code=400, detail="MyID ism-familiya ma'lumotlari to'liq emas.")
 
     passport_address = str(
         address.get("permanent_address")
@@ -984,43 +968,46 @@ def _submit_ican_credit_for_order(
         or address.get("current_address")
         or ""
     ).strip()
-    _sync_customer_address_from_myid_profile(order, profile)
-    birth_address = str(common_data.get("birth_place") or common_data.get("birth_country") or "").strip()
+    if not passport_address:
+        raise HTTPException(status_code=400, detail="Passportdagi manzil topilmadi.")
 
-    form_data: dict[str, Any] = {
-        "credit___company_id": ICAN_CREDIT_COMPANY_ID,
-        "credit___employee_id": ICAN_CREDIT_EMPLOYEE_ID,
-        "credit___tariff_id": selected_plan["tariff_id"],
-        "credit___amount": credit_amount,
-        "credit___initial_payment": initial_payment,
-        "credit___period": selected_plan["months"],
-        "credit___payment_day": 1,
-        "credit___products_note": _build_credit_products_note(products),
-        "credit___comment": f"Website checkout order #{order['id']}",
-        "user_document___passport": passport,
-        "user_document___pinfl": pinfl,
-        "user_document___last_name": last_name,
-        "user_document___first_name": first_name,
-        "user_document___middle_name": middle_name,
-        "user_document___gender": gender,
-        "user_document___birth_date": birth_date,
-        "user_document___birth_address": birth_address,
-        "user_document___passport_issue_date": passport_issue_date,
-        "user_document___passport_expiry_date": passport_expiry_date,
-        "person_main___district_id": district_id,
-        "person_main___passport_address": passport_address,
+    _sync_customer_address_from_myid_profile(order, profile)
+
+    user_document_id = _resolve_existing_ican_user_document_id(pinfl=pinfl)
+    if not user_document_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "ICAN foydalanuvchi hujjati topilmadi. "
+                "Bu mijoz uchun avval ICAN tizimida hujjat yaratilgan bo'lishi kerak."
+            ),
+        )
+
+    payload: dict[str, Any] = {
+        "company_id": ICAN_CREDIT_COMPANY_ID,
+        "employee_id": ICAN_CREDIT_EMPLOYEE_ID,
+        "tariff_id": selected_plan["tariff_id"],
+        "amount": credit_amount,
+        "initial_payment": initial_payment,
+        "period": selected_plan["months"],
+        "payment_day": 1,
+        "products_note": _build_credit_products_note(products),
+        "comment": f"Website checkout order #{order['id']}",
+        "person_main": {
+            "user_document_id": int(user_document_id),
+            "district_id": district_id,
+            "passport_address": passport_address,
+            "phones": phones,
+        },
     }
 
     if region_id > 0:
-        form_data["person_main___region_id"] = region_id
-
-    for index, phone in enumerate(phones):
-        form_data[f"person_main___phones[{index}]"] = phone
+        payload["person_main"]["region_id"] = region_id
 
     try:
         response = requests.post(
             f"{ICAN_CREDIT_API_URL}{ICAN_CREDIT_CREATE_PATH}",
-            data=form_data,
+            json=payload,
             auth=(ICAN_CREDIT_USERNAME, ICAN_CREDIT_PASSWORD),
             headers={
                 "Accept": "application/json",
@@ -1073,6 +1060,96 @@ def _extract_ican_credit_id(payload: Any) -> str:
             nested_value = _extract_ican_credit_id(item)
             if nested_value:
                 return nested_value
+
+    return ""
+
+
+def _extract_ican_user_document_id(payload: Any, *, pinfl: str = "") -> str:
+    normalized_pinfl = "".join(ch for ch in str(pinfl or "") if ch.isdigit())
+
+    if isinstance(payload, dict):
+        person_main = payload.get("person_main")
+        if isinstance(person_main, dict):
+            user_document_id = person_main.get("user_document_id")
+            if user_document_id is not None and str(user_document_id).strip():
+                if not normalized_pinfl:
+                    return str(user_document_id).strip()
+
+                user_document = person_main.get("user_document")
+                if isinstance(user_document, dict):
+                    data = user_document.get("data")
+                    if isinstance(data, dict):
+                        payload_pinfl = "".join(
+                            ch for ch in str(data.get("pinfl") or "") if ch.isdigit()
+                        )
+                        if payload_pinfl == normalized_pinfl:
+                            return str(user_document_id).strip()
+
+        user_document = payload.get("user_document")
+        if isinstance(user_document, dict):
+            user_document_id = user_document.get("id")
+            if user_document_id is not None and str(user_document_id).strip():
+                if not normalized_pinfl:
+                    return str(user_document_id).strip()
+
+                data = user_document.get("data")
+                if isinstance(data, dict):
+                    payload_pinfl = "".join(
+                        ch for ch in str(data.get("pinfl") or "") if ch.isdigit()
+                    )
+                    if payload_pinfl == normalized_pinfl:
+                        return str(user_document_id).strip()
+
+        for value in payload.values():
+            nested_value = _extract_ican_user_document_id(value, pinfl=normalized_pinfl)
+            if nested_value:
+                return nested_value
+
+    if isinstance(payload, list):
+        for item in payload:
+            nested_value = _extract_ican_user_document_id(item, pinfl=normalized_pinfl)
+            if nested_value:
+                return nested_value
+
+    return ""
+
+
+def _resolve_existing_ican_user_document_id(*, pinfl: str) -> str:
+    normalized_pinfl = "".join(ch for ch in str(pinfl or "") if ch.isdigit())
+    if len(normalized_pinfl) != 14:
+        return ""
+
+    if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
+        return ""
+
+    try:
+        response = requests.get(
+            f"{ICAN_CREDIT_API_URL}{ICAN_CREDIT_LIST_PATH}",
+            params={"filter[pinfl]": normalized_pinfl},
+            auth=(ICAN_CREDIT_USERNAME, ICAN_CREDIT_PASSWORD),
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "ru",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return ""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return ""
+
+    for item in items:
+        user_document_id = _extract_ican_user_document_id(item, pinfl=normalized_pinfl)
+        if user_document_id:
+            return user_document_id
 
     return ""
 

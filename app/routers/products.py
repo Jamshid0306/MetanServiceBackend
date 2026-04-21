@@ -211,11 +211,6 @@ def extract_upstream_error_detail(response: requests.Response) -> str:
         payload = None
 
     if isinstance(payload, dict):
-        for key in ("detail", "message", "error"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
         errors = payload.get("errors")
         if isinstance(errors, dict):
             parts: list[str] = []
@@ -228,6 +223,11 @@ def extract_upstream_error_detail(response: requests.Response) -> str:
                     parts.append(f"{field}: {text}")
             if parts:
                 return "; ".join(parts)
+
+        for key in ("detail", "message", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
 
     text = response.text.strip()
     if text:
