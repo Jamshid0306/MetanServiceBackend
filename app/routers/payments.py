@@ -6,6 +6,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from threading import Lock, Thread
 from time import perf_counter, sleep
 from typing import Any
 from uuid import uuid4
@@ -89,6 +90,10 @@ MYID_CLIENT_TOKEN_CACHE: dict[str, Any] = {
     "access_token": "",
     "expires_at": None,
 }
+ICAN_ORDER_SYNC_LOCK = Lock()
+ICAN_ORDER_SYNC_ATTEMPTS: dict[int, float] = {}
+ICAN_ORDER_SYNC_INTERVAL_SECONDS = 15.0
+ICAN_ORDER_SYNC_TIMEOUT = (2, 4)
 
 MYID_REASON_CODE_LABELS = {
     -1: "User did not consent to personal data processing",
@@ -333,13 +338,19 @@ def _extract_ican_credit_status_payload(payload: Any) -> dict[str, Any]:
     }
 
 
-def _fetch_ican_credit_details(order: dict[str, Any]) -> dict[str, Any]:
+def _fetch_ican_credit_details(
+    order: dict[str, Any],
+    *,
+    live: bool = False,
+) -> dict[str, Any]:
     stored_payload = order.get("ican_credit_payload") if isinstance(order.get("ican_credit_payload"), dict) else {}
     fallback_payload = _extract_ican_credit_status_payload(stored_payload)
     if fallback_payload:
         fallback_payload["source"] = "stored"
+        if not fallback_payload.get("id"):
+            fallback_payload["id"] = str(order.get("ican_credit_id") or "").strip()
 
-    if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
+    if not live or not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
         return fallback_payload
 
     credit_number = _extract_ican_credit_number(stored_payload)
@@ -361,7 +372,7 @@ def _fetch_ican_credit_details(order: dict[str, Any]) -> dict[str, Any]:
                 "Accept": "application/json",
                 "Accept-Language": "ru",
             },
-            timeout=8,
+            timeout=ICAN_ORDER_SYNC_TIMEOUT,
         )
         response.raise_for_status()
     except requests.RequestException:
@@ -386,6 +397,57 @@ def _fetch_ican_credit_details(order: dict[str, Any]) -> dict[str, Any]:
     if not latest_payload.get("id") and credit_id:
         latest_payload["id"] = credit_id
     return latest_payload
+
+
+def _refresh_order_ican_credit_details(order_id: int) -> None:
+    try:
+        order = get_order(order_id)
+        if not order:
+            return
+
+        latest_payload = _fetch_ican_credit_details(order, live=True)
+        if latest_payload.get("source") != "live":
+            return
+
+        payload_to_store = {
+            key: value for key, value in latest_payload.items() if key != "source"
+        }
+        stored_payload = _fetch_ican_credit_details(order)
+        stored_payload.pop("source", None)
+
+        next_credit_id = str(payload_to_store.get("id") or order.get("ican_credit_id") or "").strip()
+        if stored_payload == payload_to_store and next_credit_id == str(order.get("ican_credit_id") or "").strip():
+            return
+
+        update_order(
+            order_id,
+            ican_credit_id=next_credit_id or order.get("ican_credit_id"),
+            ican_credit_payload=payload_to_store,
+        )
+    except Exception:
+        logger.exception("Background ICAN credit sync failed for order_id=%s", order_id)
+
+
+def _queue_order_ican_credit_sync(order: dict[str, Any]) -> None:
+    order_id = int(order.get("id") or 0)
+    if order_id <= 0:
+        return
+
+    if not (order.get("ican_credit_id") or order.get("ican_credit_payload")):
+        return
+
+    now = perf_counter()
+    with ICAN_ORDER_SYNC_LOCK:
+        last_attempt = ICAN_ORDER_SYNC_ATTEMPTS.get(order_id, 0.0)
+        if now - last_attempt < ICAN_ORDER_SYNC_INTERVAL_SECONDS:
+            return
+        ICAN_ORDER_SYNC_ATTEMPTS[order_id] = now
+
+    Thread(
+        target=_refresh_order_ican_credit_details,
+        args=(order_id,),
+        daemon=True,
+    ).start()
 
 
 def _build_return_url(base_url: str | None, order_id: int) -> str:
@@ -1746,11 +1808,13 @@ def list_public_orders(phone: str) -> dict[str, Any]:
     if len(normalized_phone) != 12:
         raise HTTPException(status_code=400, detail="Valid phone number is required")
 
-    orders = [
-        _build_public_order_payload(order)
-        for order in get_orders_by_phone(normalized_phone)
-        if _is_public_order_visible(order)
-    ]
+    orders: list[dict[str, Any]] = []
+    for order in get_orders_by_phone(normalized_phone):
+        if not _is_public_order_visible(order):
+            continue
+        _queue_order_ican_credit_sync(order)
+        orders.append(_build_public_order_payload(order))
+
     return {
         "success": True,
         "orders": orders,
@@ -1798,6 +1862,7 @@ def get_public_order_status(order_id: int) -> dict[str, Any]:
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    _queue_order_ican_credit_sync(order)
     return _build_public_order_payload(order)
 
 
