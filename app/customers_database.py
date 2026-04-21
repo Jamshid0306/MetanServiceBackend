@@ -266,6 +266,75 @@ def get_customer_by_phone(phone: str):
     return serialize_customer(get_customer_record_by_phone(phone))
 
 
+def ensure_customer_profile(phone: str, name: str | None = None):
+    normalized_phone = str(phone or "").strip()
+    if not normalized_phone:
+        return None
+
+    existing_record = get_customer_record_by_phone(normalized_phone)
+    normalized_name = str(name or "").strip()
+    if existing_record:
+        existing_name = build_customer_name(existing_record)
+        if existing_name or not normalized_name:
+            return serialize_customer(existing_record)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE customers
+            SET first_name = ?, name = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                normalized_name,
+                normalized_name,
+                existing_record["id"],
+            ),
+        )
+        conn.commit()
+        cursor.execute(
+            """
+            SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
+            FROM customers
+            WHERE id = ?
+            """,
+            (existing_record["id"],),
+        )
+        record = cursor.fetchone()
+        conn.close()
+        return serialize_customer(record)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO customers (first_name, last_name, name, phone, password_hash)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            normalized_name,
+            "",
+            normalized_name,
+            normalized_phone,
+            None,
+        ),
+    )
+    customer_id = cursor.lastrowid
+    conn.commit()
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, name, phone, telegram_id, telegram_username, password_hash, address, favorites, created_at, updated_at
+        FROM customers
+        WHERE id = ?
+        """,
+        (customer_id,),
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return serialize_customer(record)
+
+
 def get_customer_record_by_id(customer_id: int | str):
     normalized_customer_id = str(customer_id or "").strip()
     if not normalized_customer_id.isdigit():

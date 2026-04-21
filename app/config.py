@@ -86,6 +86,7 @@ TELEGRAM_ORDER_BOT_TOKEN = os.getenv("TELEGRAM_ORDER_BOT_TOKEN", TELEGRAM_LOGIN_
 TELEGRAM_ORDER_CHAT_ID = os.getenv("TELEGRAM_ORDER_CHAT_ID", "").strip()
 ICAN_CREDIT_API_URL = os.getenv("ICAN_CREDIT_API_URL", "https://api.credit.icangroup.uz").rstrip("/")
 ICAN_CREDIT_CREATE_PATH = os.getenv("ICAN_CREDIT_CREATE_PATH", "/external/ican/credit/create")
+ICAN_CREDIT_LIST_PATH = os.getenv("ICAN_CREDIT_LIST_PATH", "/external/ican/credit").strip()
 ICAN_CREDIT_TRANSACTION_CREATE_PATH = os.getenv(
     "ICAN_CREDIT_TRANSACTION_CREATE_PATH",
     "/external/ican/credit-transaction/create-manually",

@@ -29,6 +29,7 @@ from ..config import (
     ICAN_CREDIT_COMPANY_ID,
     ICAN_CREDIT_CREATE_PATH,
     ICAN_CREDIT_EMPLOYEE_ID,
+    ICAN_CREDIT_LIST_PATH,
     ICAN_CREDIT_PASSWORD,
     ICAN_CREDIT_TRANSACTION_CREATE_PATH,
     ICAN_CREDIT_USERNAME,
@@ -284,6 +285,107 @@ def _extract_upstream_error_detail(response: requests.Response) -> str:
 
     text = response.text.strip()
     return text[:500] if text else "Upstream request failed."
+
+
+def _extract_ican_credit_number(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("number", "credit_number", "creditNumber"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+        for key in ("data", "result", "credit"):
+            nested_value = _extract_ican_credit_number(payload.get(key))
+            if nested_value:
+                return nested_value
+
+    if isinstance(payload, list):
+        for item in payload:
+            nested_value = _extract_ican_credit_number(item)
+            if nested_value:
+                return nested_value
+
+    return ""
+
+
+def _extract_ican_credit_status_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    status = payload.get("status")
+    status_value = ""
+    status_label = ""
+    if isinstance(status, dict):
+        status_value = str(status.get("value") or "").strip()
+        status_label = str(status.get("label") or "").strip()
+    elif status is not None:
+        status_value = str(status).strip()
+
+    return {
+        "id": str(payload.get("id") or "").strip(),
+        "number": str(payload.get("number") or "").strip(),
+        "status": status_value,
+        "status_label": status_label,
+        "cancel_reason": str(payload.get("cancel_reason") or "").strip(),
+        "comment": str(payload.get("comment") or "").strip(),
+        "updated_at": payload.get("updated_at"),
+        "created_at": payload.get("created_at"),
+    }
+
+
+def _fetch_ican_credit_details(order: dict[str, Any]) -> dict[str, Any]:
+    stored_payload = order.get("ican_credit_payload") if isinstance(order.get("ican_credit_payload"), dict) else {}
+    fallback_payload = _extract_ican_credit_status_payload(stored_payload)
+    if fallback_payload:
+        fallback_payload["source"] = "stored"
+
+    if not ICAN_CREDIT_USERNAME or not ICAN_CREDIT_PASSWORD:
+        return fallback_payload
+
+    credit_number = _extract_ican_credit_number(stored_payload)
+    credit_id = str(order.get("ican_credit_id") or "").strip()
+    params: dict[str, str] = {}
+    if credit_number:
+        params["filter[number]"] = credit_number
+    elif credit_id:
+        params["filter[id]"] = credit_id
+    else:
+        return fallback_payload
+
+    try:
+        response = requests.get(
+            f"{ICAN_CREDIT_API_URL}{ICAN_CREDIT_LIST_PATH}",
+            params=params,
+            auth=(ICAN_CREDIT_USERNAME, ICAN_CREDIT_PASSWORD),
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "ru",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return fallback_payload
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback_payload
+
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return fallback_payload
+
+    latest_payload = _extract_ican_credit_status_payload(items[0])
+    if not latest_payload:
+        return fallback_payload
+
+    latest_payload["source"] = "live"
+    if not latest_payload.get("number") and credit_number:
+        latest_payload["number"] = credit_number
+    if not latest_payload.get("id") and credit_id:
+        latest_payload["id"] = credit_id
+    return latest_payload
 
 
 def _build_return_url(base_url: str | None, order_id: int) -> str:
@@ -1554,6 +1656,7 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
     payment_method = str(order.get("payment_method") or "cash").strip().lower() or "cash"
     status_note = ""
     monthly_payments = get_monthly_payments_by_order_id(int(order["id"]))
+    ican_credit = _fetch_ican_credit_details(order)
 
     if payment_method == "click":
         status_note = order.get("click_error_note") or ""
@@ -1584,6 +1687,7 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
         ],
         "can_pay_monthly": bool(order.get("ican_credit_id")),
         "credit_submitted": bool(order.get("ican_credit_id") or order.get("ican_credit_payload")),
+        "ican_credit": ican_credit,
         "created_at": order.get("created_at"),
         "updated_at": order.get("updated_at"),
         "click_error": order.get("click_error"),

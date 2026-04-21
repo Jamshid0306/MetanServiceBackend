@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .customers_database import ensure_customer_profile
+
 DB_PATH = Path(__file__).resolve().parent.parent / "orders.db"
 
 ORDER_COLUMNS = [
@@ -315,6 +317,7 @@ def create_order(
     finally:
         conn.close()
 
+    ensure_customer_profile(phone, name)
     return get_order(order_id) or {}
 
 
@@ -476,6 +479,14 @@ def get_orders() -> list[dict[str, Any]]:
         conn.close()
 
     return [_row_to_order(row) for row in rows if row is not None]
+
+
+def sync_customer_profiles_from_orders() -> None:
+    for order in get_orders():
+        ensure_customer_profile(
+            str(order.get("phone") or "").strip(),
+            str(order.get("name") or "").strip(),
+        )
 
 
 def get_orders_by_phone(phone: str) -> list[dict[str, Any]]:
@@ -701,6 +712,11 @@ def delete_order_by_id(order_id: int) -> dict[str, Any] | None:
     if not order:
         return None
 
+    ensure_customer_profile(
+        str(order.get("phone") or "").strip(),
+        str(order.get("name") or "").strip(),
+    )
+
     conn = _get_connection()
     try:
         cursor = conn.cursor()
@@ -715,4 +731,5 @@ def delete_order_by_id(order_id: int) -> dict[str, Any] | None:
 
 init_db()
 ensure_orders_schema()
+sync_customer_profiles_from_orders()
 init_monthly_payments_db()
