@@ -41,6 +41,7 @@ class HeroSlide(Base):
 
     id = Column(Integer, primary_key=True)
     image_path = Column(String, nullable=False)
+    product_link = Column(String, nullable=True)
     duration_days = Column(Integer, nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)

@@ -245,6 +245,19 @@ def _ensure_extra_services_schema() -> None:
         conn.close()
 
 
+def _ensure_hero_slides_schema() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.cursor()
+
+        if _table_exists(cursor, "hero_slides") and not _column_exists(cursor, "hero_slides", "product_link"):
+            cursor.execute("ALTER TABLE hero_slides ADD COLUMN product_link VARCHAR")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -256,6 +269,7 @@ def get_db():
 def init_db():
     _migrate_to_products_only_schema()
     _ensure_extra_services_schema()
+    _ensure_hero_slides_schema()
     from . import models  # bu import barcha modellarni yuklaydi
 
     Base.metadata.create_all(bind=engine)

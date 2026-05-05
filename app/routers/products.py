@@ -1551,11 +1551,26 @@ async def create_product(
     config_options: str = Form(""),
     order: str = Form("999999"),
     is_active: str = Form("true"),
+    image_order: List[str] = Form([]),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
 ):
     image_urls = [save_file(file) for file in files] if files else []
+    if image_order:
+        ordered_image_urls = []
+        for item in image_order:
+            item_type, _, item_value = str(item or "").partition(":")
+            if item_type != "new":
+                continue
+            try:
+                file_index = int(item_value)
+            except ValueError:
+                continue
+            if 0 <= file_index < len(image_urls):
+                ordered_image_urls.append(image_urls[file_index])
+        if ordered_image_urls:
+            image_urls = ordered_image_urls
     is_credit_enabled = parse_bool_flag(credit_enabled)
     is_initial_payment_enabled = is_credit_enabled and parse_bool_flag(initial_payment_enabled)
     parsed_initial_payment_amount = int(parse_numeric_price(initial_payment_amount) or 0)
@@ -1650,6 +1665,7 @@ async def update_product(
     order: str = Form("999999"),
     is_active: str = Form("true"),
     oldImages: List[str] = Form([]),
+    image_order: List[str] = Form([]),
     files: List[UploadFile] = File(None),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
@@ -1718,9 +1734,28 @@ async def update_product(
     product.order = order_value
     product.is_active = 1 if parse_bool_flag(is_active) else 0
 
-    keep_images = oldImages if oldImages else []
     new_files = [save_file(file) for file in files] if files else []
-    product.images = ",".join(keep_images + new_files) if (keep_images or new_files) else None
+    keep_images = oldImages if oldImages else []
+    if image_order:
+        keep_image_set = set(keep_images)
+        ordered_images = []
+        for item in image_order:
+            item_type, _, item_value = str(item or "").partition(":")
+            if item_type == "old":
+                if item_value in keep_image_set:
+                    ordered_images.append(item_value)
+                continue
+            if item_type == "new":
+                try:
+                    file_index = int(item_value)
+                except ValueError:
+                    continue
+                if 0 <= file_index < len(new_files):
+                    ordered_images.append(new_files[file_index])
+
+        product.images = ",".join(ordered_images) if ordered_images else None
+    else:
+        product.images = ",".join(keep_images + new_files) if (keep_images or new_files) else None
 
     db.commit()
     db.refresh(product)

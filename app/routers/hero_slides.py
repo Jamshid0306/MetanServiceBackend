@@ -47,6 +47,11 @@ def normalize_duration_days(value: Any) -> int:
     return days
 
 
+def normalize_product_link(value: Any) -> str | None:
+    product_link = str(value or "").strip()
+    return product_link or None
+
+
 def cleanup_expired_hero_slides(db: Session) -> None:
     now = datetime.utcnow()
     expired_slides = (
@@ -75,6 +80,7 @@ def serialize_slide(slide: models.HeroSlide) -> dict[str, Any]:
     return {
         "id": slide.id,
         "image_path": slide.image_path,
+        "product_link": slide.product_link,
         "duration_days": slide.duration_days,
         "created_at": created_at,
         "expires_at": expires_at,
@@ -110,6 +116,7 @@ def get_admin_hero_slides(
 @router.post("")
 async def create_hero_slide(
     duration_days: str = Form(...),
+    product_link: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
@@ -120,6 +127,7 @@ async def create_hero_slide(
     image_path = save_slide_image(file)
     slide = models.HeroSlide(
         image_path=image_path,
+        product_link=normalize_product_link(product_link),
         duration_days=normalized_duration_days,
         created_at=now,
         expires_at=now + timedelta(days=normalized_duration_days),
@@ -136,6 +144,7 @@ async def create_hero_slide(
 async def update_hero_slide(
     slide_id: int,
     duration_days: str = Form(...),
+    product_link: str = Form(""),
     file: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     token: dict = Depends(verify_token),
@@ -154,6 +163,7 @@ async def update_hero_slide(
         slide.image_path = new_image_path
 
     slide.duration_days = normalized_duration_days
+    slide.product_link = normalize_product_link(product_link)
     slide.created_at = now
     slide.expires_at = now + timedelta(days=normalized_duration_days)
 
