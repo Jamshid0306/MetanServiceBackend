@@ -44,6 +44,9 @@ def _migrate_to_products_only_schema() -> None:
                     name_uz VARCHAR NOT NULL,
                     name_ru VARCHAR NOT NULL,
                     name_en VARCHAR NOT NULL,
+                    short_name_uz VARCHAR,
+                    short_name_ru VARCHAR,
+                    short_name_en VARCHAR,
                     description_uz TEXT,
                     description_ru TEXT,
                     description_en TEXT,
@@ -70,6 +73,7 @@ def _migrate_to_products_only_schema() -> None:
                 """
                 INSERT INTO products_new (
                     id, name_uz, name_ru, name_en,
+                    short_name_uz, short_name_ru, short_name_en,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
                     default_price,
@@ -80,6 +84,7 @@ def _migrate_to_products_only_schema() -> None:
                 )
                 SELECT
                     id, name_uz, name_ru, name_en,
+                    NULL, NULL, NULL,
                     description_uz, description_ru, description_en,
                     characteristic_uz, characteristic_ru, characteristic_en,
                     NULL,
@@ -93,6 +98,15 @@ def _migrate_to_products_only_schema() -> None:
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "credit_enabled"):
             cursor.execute("ALTER TABLE products ADD COLUMN credit_enabled INTEGER NOT NULL DEFAULT 0")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "short_name_uz"):
+            cursor.execute("ALTER TABLE products ADD COLUMN short_name_uz VARCHAR")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "short_name_ru"):
+            cursor.execute("ALTER TABLE products ADD COLUMN short_name_ru VARCHAR")
+
+        if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "short_name_en"):
+            cursor.execute("ALTER TABLE products ADD COLUMN short_name_en VARCHAR")
 
         if _table_exists(cursor, "products") and not _column_exists(cursor, "products", "default_price"):
             cursor.execute("ALTER TABLE products ADD COLUMN default_price VARCHAR")

@@ -12,6 +12,9 @@ class ProductBase(BaseModel):
     name_uz: str
     name_ru: str
     name_en: str
+    short_name_uz: Optional[str] = None
+    short_name_ru: Optional[str] = None
+    short_name_en: Optional[str] = None
     description_uz: str
     description_ru: str
     description_en: str

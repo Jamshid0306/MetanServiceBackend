@@ -37,6 +37,9 @@ SUMMARY_PRODUCT_COLUMNS = (
     models.Product.name_uz,
     models.Product.name_ru,
     models.Product.name_en,
+    models.Product.short_name_uz,
+    models.Product.short_name_ru,
+    models.Product.short_name_en,
     models.Product.default_price,
     models.Product.price_uz,
     models.Product.price_ru,
@@ -1227,6 +1230,9 @@ def serialize_product(product: models.Product, include_full_details: bool = True
         "name_uz": product.name_uz,
         "name_ru": product.name_ru,
         "name_en": product.name_en,
+        "short_name_uz": product.short_name_uz,
+        "short_name_ru": product.short_name_ru,
+        "short_name_en": product.short_name_en,
         "default_price": None,
         "price_uz": public_price if public_price is not None else product.price_uz,
         "price_ru": public_price if public_price is not None else product.price_ru,
@@ -1531,6 +1537,9 @@ async def create_product(
     name_uz: str = Form(...),
     name_ru: str = Form(...),
     name_en: str = Form(...),
+    short_name_uz: str = Form(""),
+    short_name_ru: str = Form(""),
+    short_name_en: str = Form(""),
     description_uz: str = Form(None),
     description_ru: str = Form(None),
     description_en: str = Form(None),
@@ -1602,6 +1611,9 @@ async def create_product(
         name_uz=name_uz,
         name_ru=name_ru,
         name_en=name_en,
+        short_name_uz=short_name_uz.strip() or None,
+        short_name_ru=short_name_ru.strip() or None,
+        short_name_en=short_name_en.strip() or None,
         description_uz=description_uz,
         description_ru=description_ru,
         description_en=description_en,
@@ -1644,6 +1656,9 @@ async def update_product(
     name_uz: str = Form(...),
     name_ru: str = Form(...),
     name_en: str = Form(...),
+    short_name_uz: str = Form(""),
+    short_name_ru: str = Form(""),
+    short_name_en: str = Form(""),
     description_uz: str = Form(...),
     description_ru: str = Form(...),
     description_en: str = Form(...),
@@ -1702,6 +1717,9 @@ async def update_product(
     product.name_uz = name_uz
     product.name_ru = name_ru
     product.name_en = name_en
+    product.short_name_uz = short_name_uz.strip() or None
+    product.short_name_ru = short_name_ru.strip() or None
+    product.short_name_en = short_name_en.strip() or None
     product.description_uz = description_uz
     product.description_ru = description_ru
     product.description_en = description_en
