@@ -8,6 +8,7 @@ from uuid import uuid4
 import requests  # type: ignore
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
 from .. import models
@@ -1298,6 +1299,33 @@ def get_products(
         "limit": limit,
         "offset": offset,
         "products": result,
+    }
+
+
+@router.get("/random")
+def get_random_products(
+    db: Session = Depends(get_db),
+    limit: int = Query(4, ge=1, le=20),
+    exclude_id: Optional[int] = Query(None, ge=1),
+):
+    query = (
+        db.query(models.Product)
+        .filter(models.Product.is_active == 1)
+        .options(load_only(*SUMMARY_PRODUCT_COLUMNS))
+    )
+
+    if exclude_id:
+        query = query.filter(models.Product.id != exclude_id)
+
+    products = query.order_by(func.random()).limit(limit).all()
+
+    return {
+        "limit": limit,
+        "exclude_id": exclude_id,
+        "products": [
+            serialize_product(product, include_full_details=False)
+            for product in products
+        ],
     }
 
 
