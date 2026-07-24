@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import CORS_ALLOW_ORIGIN_REGEX, CORS_ORIGINS, STATIC_DIR
 from .database import init_db
-from .routers import admin, customers, hero_slides, payments, products
+from .routers import admin, customers, hero_slides, nasiya, payments, products
 
 app = FastAPI(title="Shop API")
 
@@ -30,3 +30,4 @@ app.include_router(admin.router, prefix="/admin", tags=["Admin"])
 app.include_router(hero_slides.router, prefix="/hero-slides", tags=["Hero Slides"])
 app.include_router(payments.router, prefix="/payments", tags=["Payments"])
 app.include_router(payments.click_router, tags=["Click"])
+app.include_router(nasiya.router, prefix="/nasiya", tags=["Nasiya Bozor"])

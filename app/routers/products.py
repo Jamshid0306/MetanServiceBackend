@@ -27,6 +27,7 @@ from ..config import (
 )
 from ..database import get_db
 from ..orders_database import save_order
+from ..nasiya_bozor import fetch_plans as fetch_nasiya_plans
 from ..telegram_notifications import send_cash_order_notification
 
 router = APIRouter()
@@ -1331,7 +1332,31 @@ def get_random_products(
 
 @router.get("/credit/tariffs")
 def get_credit_tariffs():
-    return fetch_ican_credit_tariffs()
+    payload = fetch_nasiya_plans()
+    raw_plans = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw_plans, list):
+        raise HTTPException(status_code=502, detail="Nasiya Bozor tariff response is invalid")
+
+    return {
+        "data": [
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "months": int(item.get("durationMonths") or 0),
+                "percent": float(item.get("interestRatePct") or 0),
+                "monthly_percent": (
+                    float(item.get("interestRatePct") or 0)
+                    / int(item.get("durationMonths") or 1)
+                ),
+                "min_amount": int(item.get("minPriceMinor") or 0),
+                "max_amount": int(item.get("maxPriceMinor") or 0),
+            }
+            for item in raw_plans
+            if isinstance(item, dict)
+            and str(item.get("id") or "").strip()
+            and int(item.get("durationMonths") or 0) > 0
+        ]
+    }
 
 
 @router.get("/filter")
@@ -1878,10 +1903,10 @@ def create_order(payload: OrderPayload):
     }
 
     if order_type == "credit":
-        if payload.credit is None:
-            raise HTTPException(status_code=400, detail="Credit order data is required")
-
-        response_payload["credit"] = submit_ican_credit_request(payload.credit, products)
+        raise HTTPException(
+            status_code=410,
+            detail="Eski ICAN kredit oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
+        )
 
     order_record = save_order(
         name=name,

@@ -31,6 +31,12 @@ ORDER_COLUMNS = [
     "myid_profile",
     "ican_credit_id",
     "ican_credit_payload",
+    "nasiya_contract_id",
+    "nasiya_plan_id",
+    "nasiya_contract_status",
+    "nasiya_contract_payload",
+    "nasiya_error_note",
+    "nasiya_last_synced_at",
     "created_at",
     "updated_at",
 ]
@@ -52,6 +58,12 @@ MIGRATION_COLUMNS: dict[str, str] = {
     "myid_profile": "TEXT",
     "ican_credit_id": "TEXT",
     "ican_credit_payload": "TEXT",
+    "nasiya_contract_id": "TEXT",
+    "nasiya_plan_id": "TEXT",
+    "nasiya_contract_status": "TEXT",
+    "nasiya_contract_payload": "TEXT",
+    "nasiya_error_note": "TEXT",
+    "nasiya_last_synced_at": "TIMESTAMP",
     "updated_at": "TIMESTAMP",
 }
 
@@ -70,6 +82,11 @@ MONTHLY_PAYMENT_COLUMNS = [
     "click_error_note",
     "ican_response",
     "ican_error_note",
+    "payment_kind",
+    "provider_method",
+    "idempotency_key",
+    "nasiya_response",
+    "nasiya_error_note",
     "created_at",
     "updated_at",
 ]
@@ -114,6 +131,12 @@ def init_db() -> None:
             myid_profile TEXT,
             ican_credit_id TEXT,
             ican_credit_payload TEXT,
+            nasiya_contract_id TEXT,
+            nasiya_plan_id TEXT,
+            nasiya_contract_status TEXT,
+            nasiya_contract_payload TEXT,
+            nasiya_error_note TEXT,
+            nasiya_last_synced_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -170,10 +193,31 @@ def init_monthly_payments_db() -> None:
                 click_error_note TEXT,
                 ican_response TEXT,
                 ican_error_note TEXT,
+                payment_kind TEXT DEFAULT 'monthly',
+                provider_method TEXT,
+                idempotency_key TEXT,
+                nasiya_response TEXT,
+                nasiya_error_note TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
+        )
+        monthly_migrations = {
+            "payment_kind": "TEXT DEFAULT 'monthly'",
+            "provider_method": "TEXT",
+            "idempotency_key": "TEXT",
+            "nasiya_response": "TEXT",
+            "nasiya_error_note": "TEXT",
+        }
+        for column_name, definition in monthly_migrations.items():
+            if not _column_exists(cursor, "monthly_payments", column_name):
+                cursor.execute(
+                    f"ALTER TABLE monthly_payments ADD COLUMN {column_name} {definition}"
+                )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_monthly_payments_idempotency "
+            "ON monthly_payments(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
         conn.commit()
     finally:
@@ -222,6 +266,9 @@ def _row_to_order(row: sqlite3.Row | tuple[Any, ...] | None) -> dict[str, Any] |
     payload["products"] = _deserialize_products(payload.get("products"))
     payload["myid_profile"] = _deserialize_json_object(payload.get("myid_profile"))
     payload["ican_credit_payload"] = _deserialize_json_object(payload.get("ican_credit_payload"))
+    payload["nasiya_contract_payload"] = _deserialize_json_object(
+        payload.get("nasiya_contract_payload")
+    )
     return payload
 
 
@@ -231,6 +278,7 @@ def _row_to_monthly_payment(row: sqlite3.Row | tuple[Any, ...] | None) -> dict[s
 
     payload = dict(row)
     payload["ican_response"] = _deserialize_json_object(payload.get("ican_response"))
+    payload["nasiya_response"] = _deserialize_json_object(payload.get("nasiya_response"))
     return payload
 
 
@@ -257,6 +305,11 @@ def create_order(
     myid_profile: dict[str, Any] | None = None,
     ican_credit_id: str | None = None,
     ican_credit_payload: dict[str, Any] | None = None,
+    nasiya_contract_id: str | None = None,
+    nasiya_plan_id: str | None = None,
+    nasiya_contract_status: str | None = None,
+    nasiya_contract_payload: dict[str, Any] | None = None,
+    nasiya_error_note: str | None = None,
 ) -> dict[str, Any]:
     conn = _get_connection()
     try:
@@ -284,9 +337,15 @@ def create_order(
                 myid_result_note,
                 myid_profile,
                 ican_credit_id,
-                ican_credit_payload
+                ican_credit_payload,
+                nasiya_contract_id,
+                nasiya_plan_id,
+                nasiya_contract_status,
+                nasiya_contract_payload,
+                nasiya_error_note,
+                nasiya_last_synced_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 name,
@@ -310,6 +369,11 @@ def create_order(
                 _serialize_json_object(myid_profile),
                 ican_credit_id,
                 _serialize_json_object(ican_credit_payload),
+                nasiya_contract_id,
+                nasiya_plan_id,
+                nasiya_contract_status,
+                _serialize_json_object(nasiya_contract_payload),
+                nasiya_error_note,
             ),
         )
         order_id = int(cursor.lastrowid)
@@ -365,6 +429,12 @@ def update_order(order_id: int, **fields: Any) -> dict[str, Any] | None:
         "myid_profile",
         "ican_credit_id",
         "ican_credit_payload",
+        "nasiya_contract_id",
+        "nasiya_plan_id",
+        "nasiya_contract_status",
+        "nasiya_contract_payload",
+        "nasiya_error_note",
+        "nasiya_last_synced_at",
     }
 
     updates: dict[str, Any] = {}
@@ -376,6 +446,8 @@ def update_order(order_id: int, **fields: Any) -> dict[str, Any] | None:
         elif key == "myid_profile":
             updates[key] = _serialize_json_object(value)
         elif key == "ican_credit_payload":
+            updates[key] = _serialize_json_object(value)
+        elif key == "nasiya_contract_payload":
             updates[key] = _serialize_json_object(value)
         else:
             updates[key] = value
@@ -523,6 +595,9 @@ def create_monthly_payment(
     phone: str,
     amount: float,
     status: str = "pending",
+    payment_kind: str = "monthly",
+    provider_method: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     conn = _get_connection()
     try:
@@ -534,11 +609,23 @@ def create_monthly_payment(
                 credit_id,
                 phone,
                 amount,
-                status
+                status,
+                payment_kind,
+                provider_method,
+                idempotency_key
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (order_id, credit_id, phone, float(amount or 0), status),
+            (
+                order_id,
+                credit_id,
+                phone,
+                float(amount or 0),
+                status,
+                payment_kind,
+                provider_method,
+                idempotency_key,
+            ),
         )
         payment_id = int(cursor.lastrowid)
         conn.commit()
@@ -563,13 +650,18 @@ def update_monthly_payment(payment_id: int, **fields: Any) -> dict[str, Any] | N
         "click_error_note",
         "ican_response",
         "ican_error_note",
+        "payment_kind",
+        "provider_method",
+        "idempotency_key",
+        "nasiya_response",
+        "nasiya_error_note",
     }
 
     updates: dict[str, Any] = {}
     for key, value in fields.items():
         if key not in allowed_fields:
             continue
-        if key == "ican_response":
+        if key in {"ican_response", "nasiya_response"}:
             updates[key] = _serialize_json_object(value)
         else:
             updates[key] = value
@@ -603,6 +695,28 @@ def get_monthly_payment(payment_id: int) -> dict[str, Any] | None:
         cursor.execute(
             f"SELECT {', '.join(MONTHLY_PAYMENT_COLUMNS)} FROM monthly_payments WHERE id = ?",
             (payment_id,),
+        )
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+
+    return _row_to_monthly_payment(row)
+
+
+def get_monthly_payment_by_idempotency_key(
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    normalized_key = str(idempotency_key or "").strip()
+    if not normalized_key:
+        return None
+
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {', '.join(MONTHLY_PAYMENT_COLUMNS)} FROM monthly_payments "
+            "WHERE idempotency_key = ?",
+            (normalized_key,),
         )
         row = cursor.fetchone()
     finally:

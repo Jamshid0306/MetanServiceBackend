@@ -54,6 +54,9 @@ from ..customers_database import (
     update_customer_address_by_phone,
 )
 from ..myid_ican_locations import resolve_ican_location
+from ..nasiya_bozor import fetch_contract as fetch_nasiya_contract
+from ..nasiya_bozor import pay_contract as pay_nasiya_contract
+from ..nasiya_bozor import unwrap_data as unwrap_nasiya_data
 from ..orders_database import (
     create_order,
     create_monthly_payment,
@@ -199,6 +202,7 @@ class MonthlyPaymentInitiatePayload(BaseModel):
     amount: float | None = None
     phone: str | None = None
     return_url: str | None = None
+    payment_kind: str = "monthly"
 
 
 class SubmitCreditPayload(BaseModel):
@@ -1786,8 +1790,9 @@ def get_click_meta() -> dict[str, Any]:
 @router.get("/myid/meta")
 def get_myid_meta() -> dict[str, Any]:
     return {
-        "enabled": _myid_is_configured(),
-        "base_url": MYID_WEB_BASE_URL,
+        "enabled": False,
+        "base_url": "",
+        "replacement": "/nasiya/contracts",
     }
 
 
@@ -1796,11 +1801,19 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
     status_note = ""
     monthly_payments = get_monthly_payments_by_order_id(int(order["id"]))
     ican_credit = _fetch_ican_credit_details(order)
+    nasiya_contract_payload = order.get("nasiya_contract_payload") or {}
+    nasiya_contract = (
+        unwrap_nasiya_data(nasiya_contract_payload)
+        if isinstance(nasiya_contract_payload, dict)
+        else {}
+    )
 
     if payment_method == "click":
         status_note = order.get("click_error_note") or ""
     elif payment_method == "myid":
         status_note = order.get("myid_result_note") or ""
+    elif payment_method == "nasiya":
+        status_note = order.get("nasiya_error_note") or ""
 
     customer = get_customer_by_phone(_normalize_phone(order.get("phone")))
     customer_address = str((customer or {}).get("address") or "").strip()
@@ -1821,12 +1834,21 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
                 "created_at": payment.get("created_at"),
                 "updated_at": payment.get("updated_at"),
                 "ican_error_note": payment.get("ican_error_note") or "",
+                "nasiya_error_note": payment.get("nasiya_error_note") or "",
+                "payment_kind": payment.get("payment_kind") or "monthly",
+                "method": payment.get("provider_method") or "",
             }
             for payment in monthly_payments
         ],
-        "can_pay_monthly": bool(order.get("ican_credit_id")),
-        "credit_submitted": bool(order.get("ican_credit_id") or order.get("ican_credit_payload")),
+        "can_pay_monthly": bool(order.get("nasiya_contract_id") or order.get("ican_credit_id")),
+        "credit_submitted": bool(
+            order.get("nasiya_contract_id")
+            or order.get("ican_credit_id")
+            or order.get("ican_credit_payload")
+        ),
         "ican_credit": ican_credit,
+        "nasiya_contract": nasiya_contract,
+        "contract_id": order.get("nasiya_contract_id") or "",
         "created_at": order.get("created_at"),
         "updated_at": order.get("updated_at"),
         "click_error": order.get("click_error"),
@@ -1840,9 +1862,16 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
 def _is_public_order_visible(order: dict[str, Any]) -> bool:
     payment_method = str(order.get("payment_method") or "").strip().lower()
     status = str(order.get("status") or "").strip().lower()
-    credit_submitted = bool(order.get("ican_credit_id") or order.get("ican_credit_payload"))
+    credit_submitted = bool(
+        order.get("nasiya_contract_id")
+        or order.get("ican_credit_id")
+        or order.get("ican_credit_payload")
+    )
 
     if credit_submitted:
+        return True
+
+    if payment_method == "nasiya":
         return True
 
     if payment_method == "click":
@@ -1972,7 +2001,8 @@ def initiate_monthly_payment(
     if not _click_is_configured():
         raise HTTPException(status_code=500, detail="CLICK integration is not configured")
 
-    credit_id = str(order.get("ican_credit_id") or "").strip()
+    nasiya_contract_id = str(order.get("nasiya_contract_id") or "").strip()
+    credit_id = nasiya_contract_id or str(order.get("ican_credit_id") or "").strip()
     if not credit_id:
         raise HTTPException(status_code=400, detail="Bu buyurtma uchun kredit ID topilmadi.")
 
@@ -1981,9 +2011,20 @@ def initiate_monthly_payment(
     if request_phone and request_phone != order_phone:
         raise HTTPException(status_code=403, detail="Bu buyurtma sizga tegishli emas.")
 
+    payment_kind = str(payload.payment_kind or "monthly").strip().lower()
+    if payment_kind not in {"down_payment", "monthly"}:
+        raise HTTPException(status_code=400, detail="To'lov turi noto'g'ri.")
+
     amount = _resolve_order_monthly_payment_amount(order)
     requested_amount = float(payload.amount or 0)
-    if requested_amount > 0 and not _amounts_match(amount, requested_amount):
+    if nasiya_contract_id and requested_amount > 0:
+        amount = requested_amount
+        contract_payload = fetch_nasiya_contract(nasiya_contract_id)
+        contract = unwrap_nasiya_data(contract_payload)
+        remaining_amount = contract.get("remainingAmountMinor")
+        if remaining_amount is not None and amount > float(remaining_amount or 0):
+            raise HTTPException(status_code=400, detail="To'lov qolgan summadan katta.")
+    elif requested_amount > 0 and not _amounts_match(amount, requested_amount):
         raise HTTPException(status_code=400, detail="Oylik to'lov summasi mos kelmadi.")
 
     if amount <= 0:
@@ -1995,6 +2036,9 @@ def initiate_monthly_payment(
         phone=order_phone,
         amount=amount,
         status="pending",
+        payment_kind=payment_kind,
+        provider_method="CLICK",
+        idempotency_key=f"click-{order['id']}-{payment_kind}-{uuid4()}",
     )
     merchant_prepare_id = _build_monthly_click_transaction_param(int(payment["id"]))
     payment = update_monthly_payment(
@@ -2068,6 +2112,10 @@ def initiate_myid_payment(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="MyID oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
+    )
     name = str(payload.name or "").strip()
     phone = _normalize_phone(payload.phone)
     products = _sync_product_initial_payments_from_db(payload.products or [], db)
@@ -2159,6 +2207,10 @@ def finalize_myid_payment(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="MyID oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
+    )
     session_id = str(payload.session_id or "").strip()
     order = _resolve_order_for_myid(payload.order_id, session_id)
     if payload.order_id and not order:
@@ -2352,6 +2404,10 @@ def submit_order_credit_request(
     order_id: int,
     payload: SubmitCreditPayload | None = Body(default=None),
 ) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="ICAN kredit oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
+    )
     order = get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -2423,6 +2479,7 @@ def submit_order_credit_request(
 
 @router.post("/myid/sessions/{session_id}/result")
 def get_myid_session_result(session_id: str) -> dict[str, Any]:
+    raise HTTPException(status_code=410, detail="MyID oqimi o'chirilgan.")
     normalized_session_id = str(session_id or "").strip()
     if not normalized_session_id:
         raise HTTPException(status_code=400, detail="MyID session_id is required")
@@ -2441,6 +2498,7 @@ def get_myid_session_result(session_id: str) -> dict[str, Any]:
 
 @router.post("/myid/sessions/{session_id}/close")
 def close_myid_session(session_id: str, payload: MyIdSessionClosePayload) -> dict[str, Any]:
+    raise HTTPException(status_code=410, detail="MyID oqimi o'chirilgan.")
     normalized_session_id = str(session_id or "").strip()
     if not normalized_session_id:
         raise HTTPException(status_code=400, detail="MyID session_id is required")
@@ -2572,25 +2630,55 @@ def _handle_monthly_complete(data: dict[str, Any], payment_id: int) -> dict[str,
     ) or payment
 
     try:
-        ican_response = _submit_ican_credit_transaction(
-            credit_id=str(completed.get("credit_id") or ""),
-            amount=float(completed.get("amount") or 0),
-        )
-        completed = update_monthly_payment(
-            int(completed["id"]),
-            ican_response=ican_response,
-            ican_error_note="",
-        ) or completed
+        order = get_order(int(completed.get("order_id") or 0))
+        nasiya_contract_id = str((order or {}).get("nasiya_contract_id") or "").strip()
+        if nasiya_contract_id:
+            idempotency_key = str(completed.get("idempotency_key") or f"click-payment-{completed['id']}")
+            nasiya_response = pay_nasiya_contract(
+                nasiya_contract_id,
+                {
+                    "amountMinor": int(round(float(completed.get("amount") or 0))),
+                    "method": "CLICK",
+                    "reference": str(data.get("click_trans_id") or ""),
+                    "notes": (
+                        "Boshlang'ich to'lov"
+                        if completed.get("payment_kind") == "down_payment"
+                        else "Oylik to'lov"
+                    ),
+                },
+                idempotency_key=idempotency_key,
+            )
+            completed = update_monthly_payment(
+                int(completed["id"]),
+                nasiya_response=nasiya_response,
+                nasiya_error_note="",
+            ) or completed
+        else:
+            ican_response = _submit_ican_credit_transaction(
+                credit_id=str(completed.get("credit_id") or ""),
+                amount=float(completed.get("amount") or 0),
+            )
+            completed = update_monthly_payment(
+                int(completed["id"]),
+                ican_response=ican_response,
+                ican_error_note="",
+            ) or completed
     except HTTPException as exc:
-        update_monthly_payment(
-            int(completed["id"]),
-            ican_error_note=str(exc.detail),
-        )
+        order = get_order(int(completed.get("order_id") or 0))
+        error_field = "nasiya_error_note" if (order or {}).get("nasiya_contract_id") else "ican_error_note"
+        update_monthly_payment(int(completed["id"]), **{error_field: str(exc.detail)})
     except Exception:
-        update_monthly_payment(
-            int(completed["id"]),
-            ican_error_note="ICAN monthly transaction request failed after CLICK payment.",
-        )
+        order = get_order(int(completed.get("order_id") or 0))
+        if (order or {}).get("nasiya_contract_id"):
+            update_monthly_payment(
+                int(completed["id"]),
+                nasiya_error_note="Nasiya Bozor to'lov so'rovi CLICK to'lovidan keyin bajarilmadi.",
+            )
+        else:
+            update_monthly_payment(
+                int(completed["id"]),
+                ican_error_note="ICAN monthly transaction request failed after CLICK payment.",
+            )
 
     return _build_complete_response(
         click_trans_id=str(data.get("click_trans_id") or ""),
