@@ -46,6 +46,7 @@ from ..config import (
     MYID_REDIRECT_URL,
     MYID_SCOPE,
     MYID_WEB_BASE_URL,
+    NASIYA_BOZOR_SHOP_ID,
 )
 from ..database import get_db
 from ..customers_database import (
@@ -54,6 +55,7 @@ from ..customers_database import (
     update_customer_address_by_phone,
 )
 from ..myid_ican_locations import resolve_ican_location
+from ..nasiya_bozor import create_contract as create_nasiya_contract
 from ..nasiya_bozor import fetch_contract as fetch_nasiya_contract
 from ..nasiya_bozor import pay_contract as pay_nasiya_contract
 from ..nasiya_bozor import unwrap_data as unwrap_nasiya_data
@@ -889,6 +891,200 @@ def _extract_myid_residential_address(profile: dict[str, Any]) -> str:
         seen.add(dedupe_key)
         unique_parts.append(normalized)
     return ", ".join(unique_parts)
+
+
+def _resolve_nasiya_order_plan(products: list[dict[str, Any]]) -> dict[str, Any]:
+    selected: list[tuple[str, int]] = []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        credit_plan = product.get("credit_plan")
+        if not isinstance(credit_plan, dict):
+            continue
+        tariff_id = str(credit_plan.get("tariff_id") or credit_plan.get("id") or "").strip()
+        months = _parse_positive_int(credit_plan.get("months"))
+        if tariff_id and months > 0:
+            selected.append((tariff_id, months))
+
+    if not selected:
+        raise HTTPException(status_code=400, detail="Nasiyaga tarif tanlanmagan.")
+
+    first = selected[0]
+    if any(item != first for item in selected[1:]):
+        raise HTTPException(
+            status_code=400,
+            detail="Savatchadagi mahsulotlar uchun bir xil nasiyaga muddat tanlang.",
+        )
+
+    return {"tariff_id": first[0], "months": first[1]}
+
+
+def _extract_nasiya_contract_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    contract = unwrap_nasiya_data(payload)
+    for key in ("id", "contractId", "contract_id"):
+        value = str(contract.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _normalize_nasiya_contract_status(payload: Any) -> str:
+    contract = unwrap_nasiya_data(payload) if isinstance(payload, dict) else {}
+    return str(contract.get("status") or "pending").strip().lower() or "pending"
+
+
+def _build_nasiya_contract_for_order(
+    order: dict[str, Any],
+    *,
+    extra_phones: list[str],
+) -> tuple[dict[str, Any], str, int, float]:
+    products = order.get("products") if isinstance(order.get("products"), list) else []
+    profile = order.get("myid_profile") if isinstance(order.get("myid_profile"), dict) else {}
+    if not profile:
+        raise HTTPException(status_code=400, detail="MyID profile topilmadi.")
+
+    plan = _resolve_nasiya_order_plan(products)
+    common_data, doc_data, contacts, _, _ = _resolve_myid_profile_sections(profile)
+
+    full_name = " ".join(
+        str(value or "").strip()
+        for value in (
+            common_data.get("last_name"),
+            common_data.get("first_name"),
+            common_data.get("middle_name"),
+        )
+        if str(value or "").strip()
+    )
+    if not full_name:
+        full_name = str(order.get("name") or "").strip()
+
+    birth_date = _parse_myid_date(
+        common_data.get("birth_date")
+        or common_data.get("date_of_birth")
+        or doc_data.get("birth_date")
+    )
+    gender_value = str(common_data.get("gender") or common_data.get("sex") or "").strip().lower()
+    if gender_value in {"2", "female", "f", "ayol"}:
+        gender = "F"
+    elif gender_value in {"1", "male", "m", "erkak"}:
+        gender = "M"
+    else:
+        raise HTTPException(status_code=400, detail="MyID profilida jins topilmadi.")
+
+    passport = _normalize_pass_data(
+        doc_data.get("pass_data")
+        or doc_data.get("passport")
+        or doc_data.get("document_number")
+    )
+    pinfl = "".join(ch for ch in str(common_data.get("pinfl") or "") if ch.isdigit())
+    address = _extract_myid_residential_address(profile)
+    if (
+        not full_name
+        or not birth_date
+        or len(passport) != 9
+        or len(pinfl) != 14
+        or not address
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="MyID profilidagi shartnoma ma'lumotlari to'liq emas.",
+        )
+
+    main_phone = _normalize_phone(order.get("phone"))
+    if len(main_phone) != 12:
+        main_phone = _normalize_phone(contacts.get("phone"))
+    normalized_extra_phones: list[str] = []
+    seen_phones = {main_phone} if main_phone else set()
+    for value in extra_phones:
+        phone = _normalize_phone(value)
+        if len(phone) != 12 or phone in seen_phones:
+            continue
+        seen_phones.add(phone)
+        normalized_extra_phones.append(phone)
+    if len(main_phone) != 12 or len(normalized_extra_phones) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Asosiy va 2 ta boshqa telefon raqami kerak.",
+        )
+
+    items: list[dict[str, Any]] = []
+    total = 0
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        name = str(product.get("name") or "").strip()
+        quantity = _parse_positive_int(product.get("quantity")) or 1
+        unit_price = int(round(_parse_amount(product.get("price"))))
+        if not name or unit_price <= 0:
+            continue
+        items.append(
+            {
+                "productName": name,
+                "quantity": quantity,
+                "realUnitPriceMinor": unit_price,
+            }
+        )
+        total += unit_price * quantity
+    if not items or total <= 0:
+        raise HTTPException(status_code=400, detail="Shartnoma mahsulotlari topilmadi.")
+
+    down_payment = int(round(_resolve_initial_payment_amount(products)))
+    payload = {
+        "shopId": str(NASIYA_BOZOR_SHOP_ID or "").strip(),
+        "installmentPlanId": plan["tariff_id"],
+        "submitForApproval": False,
+        "clientFullName": full_name,
+        "clientDateOfBirth": birth_date,
+        "clientGender": gender,
+        "clientPhone": f"+{main_phone}",
+        "clientPhone2": f"+{normalized_extra_phones[0]}",
+        "clientPhone3": f"+{normalized_extra_phones[1]}",
+        "clientAddress": address,
+        "clientPassportSeries": passport[:2],
+        "clientPassportNumber": passport[2:],
+        "clientJshshir": pinfl,
+        "clientInn": "".join(ch for ch in str(common_data.get("inn") or "") if ch.isdigit()),
+        "clientGuarantorFullName": "",
+        "clientGuarantorPhone": "",
+        "clientWorkplace": "",
+        "clientSalaryMinor": 0,
+        "clientNotes": "",
+        "clientImagePath": "",
+        "productImagePath": "",
+        "clientPassportImagePath": "",
+        "items": items,
+        "downPaymentMinor": down_payment,
+        "notes": f"Website checkout order #{order['id']}",
+    }
+    if not payload["shopId"]:
+        raise HTTPException(status_code=500, detail="NASIYA_BOZOR_SHOP_ID sozlanmagan.")
+
+    return payload, str(plan["tariff_id"]), down_payment, float(total)
+
+
+def _register_nasiya_down_payment(
+    order: dict[str, Any],
+    *,
+    contract_id: str,
+    amount: int,
+) -> dict[str, Any] | None:
+    if amount <= 0:
+        return None
+    if not order.get("merchant_confirm_id") or not str(order.get("click_trans_id") or "").strip():
+        raise HTTPException(status_code=400, detail="Boshlang'ich to'lov tasdiqlanmagan.")
+
+    return pay_nasiya_contract(
+        contract_id,
+        {
+            "amountMinor": amount,
+            "method": "CLICK",
+            "reference": str(order.get("click_trans_id") or ""),
+            "notes": "Boshlang'ich to'lov",
+        },
+        idempotency_key=f"checkout-down-payment-{order['id']}-{contract_id}",
+    )
 
 
 def _sync_customer_address_from_myid_profile(
@@ -1790,9 +1986,8 @@ def get_click_meta() -> dict[str, Any]:
 @router.get("/myid/meta")
 def get_myid_meta() -> dict[str, Any]:
     return {
-        "enabled": False,
-        "base_url": "",
-        "replacement": "/nasiya/contracts",
+        "enabled": _myid_is_configured(),
+        "base_url": MYID_WEB_BASE_URL,
     }
 
 
@@ -1826,6 +2021,11 @@ def _build_public_order_payload(order: dict[str, Any]) -> dict[str, Any]:
         "total": order.get("total") or 0,
         "products": order.get("products") or [],
         "monthly_payment_amount": _resolve_order_monthly_payment_amount(order),
+        "initial_payment_completed": bool(
+            order.get("merchant_confirm_id")
+            and str(order.get("click_trans_id") or "").strip()
+            and int(order.get("click_error") or 0) == 0
+        ),
         "monthly_payments": [
             {
                 "id": payment.get("id"),
@@ -2112,10 +2312,6 @@ def initiate_myid_payment(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    raise HTTPException(
-        status_code=410,
-        detail="MyID oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
-    )
     name = str(payload.name or "").strip()
     phone = _normalize_phone(payload.phone)
     products = _sync_product_initial_payments_from_db(payload.products or [], db)
@@ -2207,10 +2403,6 @@ def finalize_myid_payment(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    raise HTTPException(
-        status_code=410,
-        detail="MyID oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
-    )
     session_id = str(payload.session_id or "").strip()
     order = _resolve_order_for_myid(payload.order_id, session_id)
     if payload.order_id and not order:
@@ -2311,21 +2503,6 @@ def finalize_myid_payment(
             "profile": profile,
         }
 
-    try:
-        _resolve_myid_ican_location(profile)
-    except HTTPException as exc:
-        update_order(
-            int(order["id"]),
-            status="cancelled",
-            payment_method="myid",
-            myid_session_id=session_id or order.get("myid_session_id"),
-            myid_job_id=job_id,
-            myid_result_code=0,
-            myid_result_note=str(exc.detail),
-            myid_profile=profile,
-        )
-        raise
-
     order = update_order(
         int(order["id"]),
         status="pending",
@@ -2404,10 +2581,6 @@ def submit_order_credit_request(
     order_id: int,
     payload: SubmitCreditPayload | None = Body(default=None),
 ) -> dict[str, Any]:
-    raise HTTPException(
-        status_code=410,
-        detail="ICAN kredit oqimi o'chirilgan. /nasiya/contracts endpointidan foydalaning.",
-    )
     order = get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -2421,19 +2594,6 @@ def submit_order_credit_request(
         if payment_method == "click" and status != "completed":
             raise HTTPException(status_code=400, detail="Avval boshlang'ich to'lovni yakunlang.")
 
-    if (
-        str(order.get("status") or "").strip().lower() == "completed"
-        and (order.get("ican_credit_id") or order.get("ican_credit_payload"))
-    ):
-        return {
-            "success": True,
-            "status": "completed",
-            "payment_method": str(order.get("payment_method") or "myid").strip().lower() or "myid",
-            "order_id": int(order["id"]),
-            "result_note": str(order.get("myid_result_note") or order.get("click_error_note") or "").strip(),
-            "credit_submitted": True,
-        }
-
     extra_phones = [
         phone
         for phone in {_normalize_phone(phone) for phone in ((payload.phones if payload else []) or [])}
@@ -2443,43 +2603,82 @@ def submit_order_credit_request(
         raise HTTPException(status_code=400, detail="2 ta qo'shimcha telefon raqami majburiy.")
 
     try:
-        credit_payload = _submit_ican_credit_for_order(
+        contract_request, plan_id, down_payment, full_total = _build_nasiya_contract_for_order(
             order,
             extra_phones=extra_phones,
+        )
+        contract_payload = (
+            order.get("nasiya_contract_payload")
+            if isinstance(order.get("nasiya_contract_payload"), dict)
+            else {}
+        )
+        contract_id = str(order.get("nasiya_contract_id") or "").strip()
+
+        if not contract_id:
+            contract_payload = create_nasiya_contract(contract_request)
+            contract_id = _extract_nasiya_contract_id(contract_payload)
+            if not contract_id:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Javobda shartnoma ID topilmadi.",
+                )
+
+            contract_status = _normalize_nasiya_contract_status(contract_payload)
+            order = update_order(
+                int(order["id"]),
+                total=full_total,
+                status=contract_status,
+                payment_method="nasiya",
+                nasiya_contract_id=contract_id,
+                nasiya_plan_id=plan_id,
+                nasiya_contract_status=contract_status,
+                nasiya_contract_payload=contract_payload,
+                nasiya_error_note="",
+            ) or order
+
+        _register_nasiya_down_payment(
+            order,
+            contract_id=contract_id,
+            amount=down_payment,
         )
     except HTTPException as exc:
         update_order(
             int(order["id"]),
             myid_result_note=str(exc.detail),
+            nasiya_error_note=str(exc.detail),
         )
         raise
 
-    success_note = "MyID tasdiqlandi va kredit arizasi yuborildi."
-    ican_credit_id = _extract_ican_credit_id(credit_payload)
+    success_note = "MyID tasdiqlandi va Nasiya arizasi yuborildi."
+    contract_status = _normalize_nasiya_contract_status(contract_payload)
     updated_order = update_order(
         int(order["id"]),
-        status="completed",
-        payment_method="myid",
+        total=full_total,
+        status=contract_status,
+        payment_method="nasiya",
         myid_result_note=success_note,
         click_error_note=success_note,
-        ican_credit_id=ican_credit_id or order.get("ican_credit_id"),
-        ican_credit_payload=credit_payload,
+        nasiya_contract_id=contract_id,
+        nasiya_plan_id=plan_id,
+        nasiya_contract_status=contract_status,
+        nasiya_contract_payload=contract_payload,
+        nasiya_error_note="",
     ) or order
 
     return {
         "success": True,
-        "status": "completed",
-        "payment_method": str(updated_order.get("payment_method") or "myid").strip().lower() or "myid",
+        "status": contract_status,
+        "payment_method": "nasiya",
         "order_id": int(updated_order["id"]),
         "result_note": success_note,
         "credit_submitted": True,
-        "credit": credit_payload,
+        "contract_id": contract_id,
+        "contract": unwrap_nasiya_data(contract_payload),
     }
 
 
 @router.post("/myid/sessions/{session_id}/result")
 def get_myid_session_result(session_id: str) -> dict[str, Any]:
-    raise HTTPException(status_code=410, detail="MyID oqimi o'chirilgan.")
     normalized_session_id = str(session_id or "").strip()
     if not normalized_session_id:
         raise HTTPException(status_code=400, detail="MyID session_id is required")
@@ -2498,7 +2697,6 @@ def get_myid_session_result(session_id: str) -> dict[str, Any]:
 
 @router.post("/myid/sessions/{session_id}/close")
 def close_myid_session(session_id: str, payload: MyIdSessionClosePayload) -> dict[str, Any]:
-    raise HTTPException(status_code=410, detail="MyID oqimi o'chirilgan.")
     normalized_session_id = str(session_id or "").strip()
     if not normalized_session_id:
         raise HTTPException(status_code=400, detail="MyID session_id is required")
