@@ -46,7 +46,6 @@ from ..config import (
     MYID_REDIRECT_URL,
     MYID_SCOPE,
     MYID_WEB_BASE_URL,
-    NASIYA_BOZOR_SHOP_ID,
 )
 from ..database import get_db
 from ..customers_database import (
@@ -57,6 +56,7 @@ from ..customers_database import (
 from ..myid_ican_locations import resolve_ican_location
 from ..nasiya_bozor import create_contract as create_nasiya_contract
 from ..nasiya_bozor import fetch_contract as fetch_nasiya_contract
+from ..nasiya_bozor import NASIYA_PUBLIC_ERROR_NOTE
 from ..nasiya_bozor import pay_contract as pay_nasiya_contract
 from ..nasiya_bozor import unwrap_data as unwrap_nasiya_data
 from ..orders_database import (
@@ -1032,7 +1032,6 @@ def _build_nasiya_contract_for_order(
 
     down_payment = int(round(_resolve_initial_payment_amount(products)))
     payload = {
-        "shopId": str(NASIYA_BOZOR_SHOP_ID or "").strip(),
         "installmentPlanId": plan["tariff_id"],
         "submitForApproval": False,
         "clientFullName": full_name,
@@ -1058,8 +1057,6 @@ def _build_nasiya_contract_for_order(
         "downPaymentMinor": down_payment,
         "notes": f"Website checkout order #{order['id']}",
     }
-    if not payload["shopId"]:
-        raise HTTPException(status_code=500, detail="NASIYA_BOZOR_SHOP_ID sozlanmagan.")
 
     return payload, str(plan["tariff_id"]), down_payment, float(total)
 
@@ -2641,11 +2638,10 @@ def submit_order_credit_request(
             contract_id=contract_id,
             amount=down_payment,
         )
-    except HTTPException as exc:
+    except HTTPException:
         update_order(
             int(order["id"]),
-            myid_result_note=str(exc.detail),
-            nasiya_error_note=str(exc.detail),
+            nasiya_error_note=NASIYA_PUBLIC_ERROR_NOTE,
         )
         raise
 
