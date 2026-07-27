@@ -27,7 +27,10 @@ from ..config import (
 )
 from ..database import get_db
 from ..orders_database import save_order
-from ..nasiya_bozor import fetch_plans as fetch_nasiya_plans
+from ..nasiya_bozor import (
+    fetch_plans as fetch_nasiya_plans,
+    normalize_nasiya_plan,
+)
 from ..telegram_notifications import send_cash_order_notification
 
 router = APIRouter()
@@ -1339,22 +1342,9 @@ def get_credit_tariffs():
 
     return {
         "data": [
-            {
-                "id": str(item.get("id") or ""),
-                "name": str(item.get("name") or ""),
-                "months": int(item.get("durationMonths") or 0),
-                "percent": float(item.get("interestRatePct") or 0),
-                "monthly_percent": (
-                    float(item.get("interestRatePct") or 0)
-                    / int(item.get("durationMonths") or 1)
-                ),
-                "min_amount": int(item.get("minPriceMinor") or 0),
-                "max_amount": int(item.get("maxPriceMinor") or 0),
-            }
+            plan
             for item in raw_plans
-            if isinstance(item, dict)
-            and str(item.get("id") or "").strip()
-            and int(item.get("durationMonths") or 0) > 0
+            if (plan := normalize_nasiya_plan(item)) is not None
         ]
     }
 

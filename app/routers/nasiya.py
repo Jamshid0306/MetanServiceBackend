@@ -14,6 +14,7 @@ from ..nasiya_bozor import (
     fetch_contract,
     fetch_plans,
     is_configured,
+    normalize_nasiya_plan,
     pay_contract,
     unwrap_data,
 )
@@ -97,26 +98,6 @@ def _extract_contract_id(payload: dict[str, Any]) -> str:
         if value:
             return value
     return ""
-
-
-def _normalize_plan(item: Any) -> dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    plan_id = str(item.get("id") or "").strip()
-    months = int(item.get("durationMonths") or 0)
-    percent = float(item.get("interestRatePct") or 0)
-    if not plan_id or months <= 0 or percent < 0:
-        return None
-    return {
-        "id": plan_id,
-        "name": str(item.get("name") or "").strip(),
-        "months": months,
-        "percent": percent,
-        "monthly_percent": round(percent / months, 4) if months else None,
-        "penalty_percent": float(item.get("penaltyRatePct") or 0),
-        "min_amount": int(item.get("minPriceMinor") or 0),
-        "max_amount": int(item.get("maxPriceMinor") or 0),
-    }
 
 
 def _payment_payload(payment: dict[str, Any]) -> dict[str, Any]:
@@ -237,7 +218,11 @@ def get_plans() -> dict[str, Any]:
     raw_plans = payload.get("data")
     if not isinstance(raw_plans, list):
         raise HTTPException(status_code=502, detail="Tariflar noto'g'ri formatda qaytdi.")
-    plans = [plan for item in raw_plans if (plan := _normalize_plan(item)) is not None]
+    plans = [
+        plan
+        for item in raw_plans
+        if (plan := normalize_nasiya_plan(item)) is not None
+    ]
     return {"data": plans}
 
 

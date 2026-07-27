@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 import requests
@@ -14,6 +15,72 @@ from .config import (
 
 
 REQUEST_TIMEOUT = (NASIYA_BOZOR_CONNECT_TIMEOUT, NASIYA_BOZOR_READ_TIMEOUT)
+PERCENT_QUANTUM = Decimal("0.0001")
+MONTHS_PER_YEAR = Decimal("12")
+
+
+def _parse_decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+    return parsed if parsed.is_finite() else None
+
+
+def _parse_positive_months(value: Any) -> int | None:
+    parsed = _parse_decimal(value)
+    if parsed is None or parsed <= 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
+def _parse_minor_amount(value: Any) -> int:
+    parsed = _parse_decimal(value)
+    if parsed is None or parsed < 0:
+        return 0
+    return int(parsed)
+
+
+def _rounded_percent(value: Decimal) -> float:
+    return float(value.quantize(PERCENT_QUANTUM, rounding=ROUND_HALF_UP))
+
+
+def normalize_nasiya_plan(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+
+    plan_id = str(item.get("id") or "").strip()
+    months = _parse_positive_months(item.get("durationMonths"))
+    annual_percent = _parse_decimal(item.get("interestRatePct"))
+    penalty_percent = _parse_decimal(item.get("penaltyRatePct")) or Decimal("0")
+
+    if (
+        not plan_id
+        or months is None
+        or annual_percent is None
+        or annual_percent < 0
+        or penalty_percent < 0
+    ):
+        return None
+
+    term_percent = annual_percent * Decimal(months) / MONTHS_PER_YEAR
+    monthly_percent = annual_percent / MONTHS_PER_YEAR
+
+    return {
+        "id": plan_id,
+        "name": str(item.get("name") or "").strip(),
+        "months": months,
+        "annual_percent": _rounded_percent(annual_percent),
+        "percent": _rounded_percent(term_percent),
+        "monthly_percent": _rounded_percent(monthly_percent),
+        "penalty_percent": _rounded_percent(penalty_percent),
+        "min_amount": _parse_minor_amount(item.get("minPriceMinor")),
+        "max_amount": _parse_minor_amount(item.get("maxPriceMinor")),
+    }
 
 
 def is_configured() -> bool:
