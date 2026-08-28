@@ -95,6 +95,32 @@ def init_customer_login_sessions_db():
     conn.close()
 
 
+def init_customer_sms_login_otps_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_sms_login_otps (
+            phone TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            resend_available_at INTEGER NOT NULL,
+            window_started_at INTEGER NOT NULL,
+            send_count INTEGER NOT NULL DEFAULT 1,
+            attempts_remaining INTEGER NOT NULL DEFAULT 5,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        "DELETE FROM customer_sms_login_otps WHERE window_started_at <= ?",
+        (int(time.time()) - 86400,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def init_customer_registration_sessions_db():
     conn = get_connection()
     cursor = conn.cursor()
@@ -814,6 +840,158 @@ def complete_customer_login_session(
     conn.close()
 
 
+def reserve_customer_sms_login_otp(
+    phone: str,
+    code_hash: str,
+    *,
+    ttl_seconds: int,
+    resend_seconds: int,
+    rate_window_seconds: int,
+    max_sends: int,
+    max_attempts: int,
+):
+    normalized_phone = str(phone or "").strip()
+    current_timestamp = int(time.time())
+    conn = get_connection()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        record = conn.execute(
+            """
+            SELECT resend_available_at, window_started_at, send_count
+            FROM customer_sms_login_otps
+            WHERE phone = ?
+            """,
+            (normalized_phone,),
+        ).fetchone()
+
+        if record and int(record["resend_available_at"] or 0) > current_timestamp:
+            conn.rollback()
+            return {
+                "status": "cooldown",
+                "retry_after": int(record["resend_available_at"]) - current_timestamp,
+            }
+
+        window_started_at = int(record["window_started_at"] or 0) if record else 0
+        send_count = int(record["send_count"] or 0) if record else 0
+        if not window_started_at or current_timestamp - window_started_at >= rate_window_seconds:
+            window_started_at = current_timestamp
+            send_count = 0
+
+        if send_count >= max_sends:
+            retry_after = max(1, rate_window_seconds - (current_timestamp - window_started_at))
+            conn.rollback()
+            return {"status": "rate_limited", "retry_after": retry_after}
+
+        conn.execute(
+            """
+            INSERT INTO customer_sms_login_otps (
+                phone, code_hash, expires_at, resend_available_at,
+                window_started_at, send_count, attempts_remaining, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(phone) DO UPDATE SET
+                code_hash = excluded.code_hash,
+                expires_at = excluded.expires_at,
+                resend_available_at = excluded.resend_available_at,
+                window_started_at = excluded.window_started_at,
+                send_count = excluded.send_count,
+                attempts_remaining = excluded.attempts_remaining,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                normalized_phone,
+                str(code_hash or "").strip(),
+                current_timestamp + ttl_seconds,
+                current_timestamp + resend_seconds,
+                window_started_at,
+                send_count + 1,
+                max_attempts,
+            ),
+        )
+        conn.commit()
+        return {
+            "status": "reserved",
+            "expires_in": ttl_seconds,
+            "retry_after": resend_seconds,
+        }
+    finally:
+        conn.close()
+
+
+def release_customer_sms_login_otp(phone: str, code_hash: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM customer_sms_login_otps WHERE phone = ? AND code_hash = ?",
+        (str(phone or "").strip(), str(code_hash or "").strip()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def verify_customer_sms_login_otp(phone: str, code_hash: str):
+    normalized_phone = str(phone or "").strip()
+    current_timestamp = int(time.time())
+    conn = get_connection()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        record = conn.execute(
+            """
+            SELECT code_hash, expires_at, attempts_remaining
+            FROM customer_sms_login_otps
+            WHERE phone = ?
+            """,
+            (normalized_phone,),
+        ).fetchone()
+        if not record or not str(record["code_hash"] or "").strip():
+            conn.rollback()
+            return {"status": "missing", "attempts_remaining": 0}
+
+        if int(record["expires_at"] or 0) <= current_timestamp:
+            conn.execute(
+                """
+                UPDATE customer_sms_login_otps
+                SET code_hash = '', attempts_remaining = 0, updated_at = CURRENT_TIMESTAMP
+                WHERE phone = ?
+                """,
+                (normalized_phone,),
+            )
+            conn.commit()
+            return {"status": "expired", "attempts_remaining": 0}
+
+        attempts_remaining = int(record["attempts_remaining"] or 0)
+        if attempts_remaining <= 0:
+            conn.rollback()
+            return {"status": "attempts_exceeded", "attempts_remaining": 0}
+
+        if hmac.compare_digest(str(record["code_hash"]), str(code_hash or "")):
+            conn.execute(
+                "DELETE FROM customer_sms_login_otps WHERE phone = ?",
+                (normalized_phone,),
+            )
+            conn.commit()
+            return {"status": "verified", "attempts_remaining": attempts_remaining}
+
+        attempts_remaining -= 1
+        conn.execute(
+            """
+            UPDATE customer_sms_login_otps
+            SET code_hash = CASE WHEN ? <= 0 THEN '' ELSE code_hash END,
+                attempts_remaining = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE phone = ?
+            """,
+            (attempts_remaining, attempts_remaining, normalized_phone),
+        )
+        conn.commit()
+        return {
+            "status": "invalid" if attempts_remaining > 0 else "attempts_exceeded",
+            "attempts_remaining": attempts_remaining,
+        }
+    finally:
+        conn.close()
+
+
 def get_customer_registration_session(state: str):
     normalized_state = str(state or "").strip()
     if not normalized_state:
@@ -1131,5 +1309,6 @@ def save_or_update_customer_from_telegram(
 init_customers_db()
 ensure_customer_columns()
 init_customer_login_sessions_db()
+init_customer_sms_login_otps_db()
 init_customer_registration_sessions_db()
 ensure_customer_registration_session_columns()

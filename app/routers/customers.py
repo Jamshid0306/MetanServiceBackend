@@ -12,7 +12,17 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..auth import verify_admin_token, verify_token
-from ..config import SECRET_KEY, TELEGRAM_LOGIN_BOT_TOKEN, TELEGRAM_LOGIN_BOT_USERNAME
+from ..config import (
+    TEXTUP_SMS_TEMPLATE,
+    SECRET_KEY,
+    SMS_LOGIN_MAX_ATTEMPTS,
+    SMS_LOGIN_MAX_SENDS,
+    SMS_LOGIN_OTP_TTL_SECONDS,
+    SMS_LOGIN_RATE_WINDOW_SECONDS,
+    SMS_LOGIN_RESEND_SECONDS,
+    TELEGRAM_LOGIN_BOT_TOKEN,
+    TELEGRAM_LOGIN_BOT_USERNAME,
+)
 from ..customers_database import (
     authenticate_customer,
     complete_customer_registration_session,
@@ -33,6 +43,8 @@ from ..customers_database import (
     mark_customer_registration_session_awaiting_contact,
     mark_customer_registration_session_failed,
     normalize_telegram_username,
+    release_customer_sms_login_otp,
+    reserve_customer_sms_login_otp,
     save_customer_login_session,
     save_customer_registration_session,
     save_or_update_customer_from_telegram,
@@ -40,7 +52,9 @@ from ..customers_database import (
     update_customer_telegram_by_phone,
     update_customer_favorites,
     update_customer_password_by_phone,
+    verify_customer_sms_login_otp,
 )
+from ..services.textup import TextUpError, is_textup_configured, send_sms
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -204,6 +218,15 @@ def send_telegram_text_message(
 class CustomerLoginPayload(BaseModel):
     identifier: str
     password: str
+
+
+class CustomerSmsLoginSendPayload(BaseModel):
+    phone: str
+
+
+class CustomerSmsLoginVerifyPayload(BaseModel):
+    phone: str
+    code: str
 
 
 class CustomerResponse(BaseModel):
@@ -378,6 +401,24 @@ def build_customer_auth_response(customer: dict[str, Any]) -> dict[str, Any]:
         "access_token": create_customer_access_token(customer),
         "token_type": "bearer",
     }
+
+
+def hash_sms_login_code(phone: str, code: str) -> str:
+    return hmac.new(
+        SECRET_KEY.encode("utf-8"),
+        f"customer-sms-login:{phone}:{code}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def validate_sms_login_phone(value: str) -> str:
+    normalized_phone = normalize_phone_number(value)
+    if len(normalized_phone) != 12 or not normalized_phone.startswith("998"):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid Uzbekistan phone number",
+        )
+    return normalized_phone
 
 
 def get_authenticated_customer(token: dict = Depends(verify_token)) -> dict[str, Any]:
@@ -588,6 +629,119 @@ def login_customer(payload: CustomerLoginPayload):
             detail="Phone number, username or password is incorrect",
         )
 
+    return build_customer_auth_response(customer)
+
+
+@router.get("/login/sms/config")
+def get_sms_login_config():
+    return {
+        "enabled": is_textup_configured(),
+        "expires_in": SMS_LOGIN_OTP_TTL_SECONDS,
+        "resend_after": SMS_LOGIN_RESEND_SECONDS,
+    }
+
+
+@router.post(
+    "/login/sms/send",
+    summary="Send an SMS login code",
+    description="Creates a short-lived OTP and sends it to an existing customer's phone through TextUp.",
+)
+def send_customer_sms_login_code(payload: CustomerSmsLoginSendPayload):
+    if not is_textup_configured():
+        raise HTTPException(status_code=503, detail="SMS login is not configured")
+
+    phone = validate_sms_login_phone(payload.phone)
+    if not get_customer_by_phone(phone):
+        raise HTTPException(
+            status_code=404,
+            detail="Customer profile was not found for this phone number",
+        )
+
+    code = str(secrets.randbelow(9_000) + 1_000)
+    code_hash = hash_sms_login_code(phone, code)
+    reservation = reserve_customer_sms_login_otp(
+        phone,
+        code_hash,
+        ttl_seconds=SMS_LOGIN_OTP_TTL_SECONDS,
+        resend_seconds=SMS_LOGIN_RESEND_SECONDS,
+        rate_window_seconds=SMS_LOGIN_RATE_WINDOW_SECONDS,
+        max_sends=SMS_LOGIN_MAX_SENDS,
+        max_attempts=SMS_LOGIN_MAX_ATTEMPTS,
+    )
+    reservation_status = str(reservation.get("status") or "")
+    if reservation_status != "reserved":
+        retry_after = max(1, int(reservation.get("retry_after") or 1))
+        detail = (
+            "Please wait before requesting another SMS code"
+            if reservation_status == "cooldown"
+            else "Too many SMS codes requested. Please try again later"
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=detail,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    try:
+        message = TEXTUP_SMS_TEMPLATE.format(code=code)
+        send_sms(phone, message)
+    except TextUpError as error:
+        release_customer_sms_login_otp(phone, code_hash)
+        logger.warning("SMS login code delivery failed: %s", error.public_detail)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": error.public_detail,
+                **({"textup_debug": error.debug} if error.debug else {}),
+            },
+        ) from None
+    except (KeyError, ValueError):
+        release_customer_sms_login_otp(phone, code_hash)
+        logger.exception("SMS login message template is invalid")
+        raise HTTPException(
+            status_code=500,
+            detail="SMS message template is invalid",
+        ) from None
+
+    return {
+        "success": True,
+        "message": "Verification code was sent",
+        "expires_in": int(reservation.get("expires_in") or SMS_LOGIN_OTP_TTL_SECONDS),
+        "resend_after": int(reservation.get("retry_after") or SMS_LOGIN_RESEND_SECONDS),
+    }
+
+
+@router.post(
+    "/login/sms/verify",
+    summary="Verify an SMS login code",
+    description="Consumes a valid one-time code and returns a customer access token.",
+)
+def verify_customer_sms_login_code(payload: CustomerSmsLoginVerifyPayload):
+    phone = validate_sms_login_phone(payload.phone)
+    code = str(payload.code or "").strip()
+    if len(code) != 4 or not code.isascii() or not code.isdigit():
+        raise HTTPException(status_code=400, detail="Enter the 4-digit verification code")
+
+    verification = verify_customer_sms_login_otp(
+        phone,
+        hash_sms_login_code(phone, code),
+    )
+    verification_status = str(verification.get("status") or "missing")
+    if verification_status != "verified":
+        details = {
+            "missing": "Verification code was not found. Request a new code",
+            "expired": "Verification code has expired. Request a new code",
+            "invalid": "Verification code is incorrect",
+            "attempts_exceeded": "Too many incorrect attempts. Request a new code",
+        }
+        raise HTTPException(
+            status_code=400,
+            detail=details.get(verification_status, "Verification code could not be checked"),
+        )
+
+    customer = get_customer_by_phone(phone)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer profile was not found")
     return build_customer_auth_response(customer)
 
 
