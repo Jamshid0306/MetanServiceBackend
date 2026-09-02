@@ -46,6 +46,7 @@ from ..config import (
     MYID_REDIRECT_URL,
     MYID_SCOPE,
     MYID_WEB_BASE_URL,
+    NASIYA_BOZOR_SHOP_ID,
 )
 from ..database import get_db
 from ..customers_database import (
@@ -729,6 +730,11 @@ def _sync_product_initial_payments_from_db(
                 if initial_payment_enabled
                 else 0
             )
+            normalized_product["images"] = [
+                image.strip()
+                for image in str(current_product.images or "").split(",")
+                if image.strip()
+            ]
 
         normalized_products.append(normalized_product)
 
@@ -945,6 +951,10 @@ def _build_nasiya_contract_for_order(
     if not profile:
         raise HTTPException(status_code=400, detail="MyID profile topilmadi.")
 
+    shop_id = str(NASIYA_BOZOR_SHOP_ID or "").strip()
+    if not shop_id:
+        raise HTTPException(status_code=500, detail="NASIYA_BOZOR_SHOP_ID sozlanmagan.")
+
     plan = _resolve_nasiya_order_plan(products)
     common_data, doc_data, contacts, _, _ = _resolve_myid_profile_sections(profile)
 
@@ -1030,8 +1040,28 @@ def _build_nasiya_contract_for_order(
     if not items or total <= 0:
         raise HTTPException(status_code=400, detail="Shartnoma mahsulotlari topilmadi.")
 
+    product_image_path = ""
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        images = product.get("images")
+        if isinstance(images, list) and images:
+            product_image_path = str(images[0] or "").strip()
+        elif isinstance(images, str):
+            product_image_path = images.split(",", 1)[0].strip()
+        if product_image_path:
+            break
+
+    myid_job_id = str(order.get("myid_job_id") or "").strip()
+    if not myid_job_id or not product_image_path:
+        raise HTTPException(
+            status_code=400,
+            detail="MyID tasdiqlash havolasi yoki mahsulot rasmi topilmadi.",
+        )
+
     down_payment = int(round(_resolve_initial_payment_amount(products)))
     payload = {
+        "shopId": shop_id,
         "installmentPlanId": plan["tariff_id"],
         "submitForApproval": False,
         "clientFullName": full_name,
@@ -1050,8 +1080,8 @@ def _build_nasiya_contract_for_order(
         "clientWorkplace": "",
         "clientSalaryMinor": 0,
         "clientNotes": "",
-        "clientImagePath": "",
-        "productImagePath": "",
+        "clientImagePath": f"myid-job:{myid_job_id}",
+        "productImagePath": product_image_path,
         "clientPassportImagePath": "",
         "items": items,
         "downPaymentMinor": down_payment,
@@ -1984,6 +2014,7 @@ def get_click_meta() -> dict[str, Any]:
 def get_myid_meta() -> dict[str, Any]:
     return {
         "enabled": _myid_is_configured(),
+        "credit_enabled": bool(NASIYA_BOZOR_SHOP_ID),
         "base_url": MYID_WEB_BASE_URL,
     }
 
@@ -2577,6 +2608,7 @@ def finalize_myid_payment(
 def submit_order_credit_request(
     order_id: int,
     payload: SubmitCreditPayload | None = Body(default=None),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     order = get_order(order_id)
     if not order:
@@ -2584,6 +2616,16 @@ def submit_order_credit_request(
 
     if not order.get("myid_profile") or int(order.get("myid_result_code") or 0) != 1:
         raise HTTPException(status_code=400, detail="MyID tasdig'i topilmadi.")
+
+    synced_products = _sync_product_initial_payments_from_db(
+        order.get("products") or [],
+        db,
+    )
+    if synced_products != (order.get("products") or []):
+        order = update_order(int(order["id"]), products=synced_products) or {
+            **order,
+            "products": synced_products,
+        }
 
     if _order_requires_initial_payment(order):
         payment_method = str(order.get("payment_method") or "").strip().lower()

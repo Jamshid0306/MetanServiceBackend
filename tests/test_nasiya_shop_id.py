@@ -1,15 +1,14 @@
 import unittest
 from unittest.mock import patch
 
-from app import config
 from app.routers import nasiya, payments
 
 
-class NasiyaShopIdRemovalTests(unittest.TestCase):
-    def test_direct_contract_ignores_legacy_shop_id_and_does_not_forward_it(self):
+class NasiyaContractRequirementsTests(unittest.TestCase):
+    def test_direct_contract_forwards_configured_shop_id_and_image_paths(self):
         payload = nasiya.ContractCreatePayload.model_validate(
             {
-                "shopId": "legacy-shop-id",
+                "shopId": "untrusted-client-shop-id",
                 "installmentPlanId": "plan-12",
                 "clientFullName": "Test User",
                 "clientDateOfBirth": "1990-01-01",
@@ -21,6 +20,8 @@ class NasiyaShopIdRemovalTests(unittest.TestCase):
                 "clientPassportSeries": "AA",
                 "clientPassportNumber": "1234567",
                 "clientJshshir": "12345678901234",
+                "clientImagePath": "customer/image.jpg",
+                "productImagePath": "product/image.jpg",
                 "items": [
                     {
                         "productName": "Test product",
@@ -31,9 +32,8 @@ class NasiyaShopIdRemovalTests(unittest.TestCase):
             }
         )
 
-        self.assertNotIn("shopId", payload.model_dump())
-
         with (
+            patch.object(nasiya, "NASIYA_BOZOR_SHOP_ID", "configured-shop-id"),
             patch.object(
                 nasiya,
                 "create_contract",
@@ -45,18 +45,22 @@ class NasiyaShopIdRemovalTests(unittest.TestCase):
 
         self.assertEqual(response["contract_id"], "contract-1")
         forwarded_payload = create_contract_mock.call_args.args[0]
-        self.assertNotIn("shopId", forwarded_payload)
+        self.assertEqual(forwarded_payload["shopId"], "configured-shop-id")
+        self.assertEqual(forwarded_payload["clientImagePath"], "customer/image.jpg")
+        self.assertEqual(forwarded_payload["productImagePath"], "product/image.jpg")
 
-    def test_checkout_contract_payload_does_not_require_or_send_shop_id(self):
+    def test_checkout_contract_sends_provider_required_references(self):
         order = {
             "id": 42,
             "name": "Test User",
             "phone": "+998901111111",
+            "myid_job_id": "myid-job-42",
             "products": [
                 {
                     "name": "Test product",
                     "quantity": 1,
                     "price": 1_000_000,
+                    "images": ["/static/images/product.jpg"],
                 }
             ],
             "myid_profile": {"verified": True},
@@ -72,6 +76,7 @@ class NasiyaShopIdRemovalTests(unittest.TestCase):
         document_data = {"pass_data": "AA1234567"}
 
         with (
+            patch.object(payments, "NASIYA_BOZOR_SHOP_ID", "configured-shop-id"),
             patch.object(
                 payments,
                 "_resolve_nasiya_order_plan",
@@ -105,15 +110,22 @@ class NasiyaShopIdRemovalTests(unittest.TestCase):
                 )
             )
 
-        self.assertNotIn("shopId", contract_payload)
+        self.assertEqual(contract_payload["shopId"], "configured-shop-id")
+        self.assertEqual(contract_payload["clientImagePath"], "myid-job:myid-job-42")
+        self.assertEqual(contract_payload["productImagePath"], "/static/images/product.jpg")
         self.assertEqual(plan_id, "plan-12")
         self.assertEqual(down_payment, 100_000)
         self.assertEqual(total, 1_000_000)
 
-    def test_meta_and_config_no_longer_expose_shop_id(self):
-        self.assertFalse(hasattr(config, "NASIYA_BOZOR_SHOP_ID"))
-        with patch.object(nasiya, "is_configured", return_value=True):
-            self.assertEqual(nasiya.get_meta(), {"enabled": True})
+    def test_meta_reports_shop_configuration(self):
+        with (
+            patch.object(nasiya, "NASIYA_BOZOR_SHOP_ID", "configured-shop-id"),
+            patch.object(nasiya, "is_configured", return_value=True),
+        ):
+            self.assertEqual(
+                nasiya.get_meta(),
+                {"enabled": True, "shop_id_configured": True},
+            )
 
 
 if __name__ == "__main__":

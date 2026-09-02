@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from ..config import NASIYA_BOZOR_SHOP_ID
 from ..customers_database import get_customer_by_phone
 from ..nasiya_bozor import (
     NASIYA_PUBLIC_ERROR_NOTE,
@@ -40,6 +41,7 @@ class ContractItem(BaseModel):
 
 
 class ContractCreatePayload(BaseModel):
+    shopId: str | None = None
     installmentPlanId: str
     submitForApproval: bool = False
     clientFullName: str
@@ -208,7 +210,11 @@ def _public_order(order: dict[str, Any], *, sync: bool = False) -> dict[str, Any
 
 @router.get("/meta")
 def get_meta() -> dict[str, Any]:
-    return {"enabled": is_configured()}
+    shop_id_configured = bool(NASIYA_BOZOR_SHOP_ID)
+    return {
+        "enabled": is_configured() and shop_id_configured,
+        "shop_id_configured": shop_id_configured,
+    }
 
 
 @router.get("/plans")
@@ -233,11 +239,24 @@ def submit_contract(payload: ContractCreatePayload) -> dict[str, Any]:
     if not phone or not phone2 or not phone3:
         raise HTTPException(status_code=400, detail="3 ta to'g'ri telefon raqami kerak.")
 
+    shop_id = str(NASIYA_BOZOR_SHOP_ID or "").strip()
+    if not shop_id:
+        raise HTTPException(status_code=500, detail="NASIYA_BOZOR_SHOP_ID sozlanmagan.")
+
+    client_image_path = str(payload.clientImagePath or "").strip()
+    product_image_path = str(payload.productImagePath or "").strip()
+    if not client_image_path or not product_image_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Mijoz va mahsulot rasmi majburiy.",
+        )
+
     external_payload = payload.model_dump(
         exclude={"locale", "products"},
     )
     external_payload.update(
         {
+            "shopId": shop_id,
             "clientPhone": f"+{phone}",
             "clientPhone2": phone2,
             "clientPhone3": phone3,

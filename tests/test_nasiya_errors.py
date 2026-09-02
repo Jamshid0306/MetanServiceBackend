@@ -346,6 +346,11 @@ class NasiyaPersistenceSafetyTests(unittest.TestCase):
             ),
             patch.object(
                 payments,
+                "_sync_product_initial_payments_from_db",
+                return_value=order["products"],
+            ),
+            patch.object(
+                payments,
                 "create_nasiya_contract",
                 side_effect=self.upstream_error,
             ),
